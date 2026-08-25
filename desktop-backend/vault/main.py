@@ -6,6 +6,8 @@ import logging
 import os
 import re
 import secrets
+import tempfile
+import threading
 import traceback
 import uuid
 from email.mime.text import MIMEText
@@ -15,7 +17,7 @@ from typing import Dict, List
 import bcrypt
 import jwt
 import httpx
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, EmailStr
@@ -1302,6 +1304,300 @@ async def summarize(
     if not summary:
         return {"status": "error", "message": "The model returned an empty summary."}
     return {"status": "success", "summary": summary}
+
+
+# ---------------------------------------------------------------------------
+# Background diarisation jobs
+#
+# The client uploads every audio chunk once and may then close entirely. The
+# work runs here and the result is written to Cosmos, so it is still waiting
+# when the user comes back.
+#
+# The worker is a plain daemon thread inside this web process rather than a
+# separate service, for the reason the sibling project documents: Render has no
+# free Background Worker tier, while Web Services do have one. RQ and Redis are
+# not used, because this vault already has Cosmos and one queue of long jobs
+# does not need a broker.
+#
+# Honest limit: audio is staged on the instance's local disk, which Render
+# wipes when a free instance spins down. Durability therefore covers the job
+# record and its result, not a job caught mid-flight -- those are failed
+# explicitly on the next boot instead of hanging forever. Moving JOB_AUDIO_DIR
+# to blob storage is what would close that gap.
+# ---------------------------------------------------------------------------
+JOB_AUDIO_DIR = os.path.join(tempfile.gettempdir(), "threadnotes-jobs")
+
+# Cosmos rejects documents over 2 MB. A long diarised transcript carrying word
+# timings can approach that, so the result is degraded rather than lost.
+JOB_DOC_SOFT_LIMIT = 1_500_000
+
+_jobs_cont = None
+
+
+def get_jobs_container():
+    """The jobs container, created on first use so no manual setup is needed."""
+    global _jobs_cont
+    if _jobs_cont is None:
+        if not COSMOS_ENDPOINT or not COSMOS_KEY or not DATABASE_NAME:
+            raise HTTPException(
+                status_code=500, detail="Cosmos DB configuration is missing."
+            )
+        from azure.cosmos import PartitionKey
+
+        client = CosmosClient(COSMOS_ENDPOINT, COSMOS_KEY)
+        database = client.get_database_client(DATABASE_NAME)
+        _jobs_cont = database.create_container_if_not_exists(
+            id=secret("COSMOS_JOBS_CONTAINER", "diarizeJobs"),
+            partition_key=PartitionKey(path="/email"),
+        )
+    return _jobs_cont
+
+
+def _job_public(doc: dict) -> dict:
+    """The job as the client sees it. Segments ride along only once ready."""
+    out = {
+        "job_id": doc.get("id"),
+        "status": doc.get("status"),
+        "topic": doc.get("topic"),
+        "meeting_id": doc.get("meeting_id"),
+        "duration_sec": doc.get("duration_sec"),
+        "created_at": doc.get("created_at"),
+        "completed_at": doc.get("completed_at"),
+        "error": doc.get("error"),
+        "words_dropped": doc.get("words_dropped", False),
+    }
+    if doc.get("status") == "completed":
+        out["segments"] = doc.get("segments") or []
+    return out
+
+
+def _job_save(doc: dict):
+    try:
+        get_jobs_container().upsert_item(doc)
+    except Exception:
+        traceback.print_exc()
+
+
+def _job_audio_paths(job_id: str) -> List[str]:
+    folder = os.path.join(JOB_AUDIO_DIR, job_id)
+    if not os.path.isdir(folder):
+        return []
+    return [os.path.join(folder, n) for n in sorted(os.listdir(folder))]
+
+
+def _job_cleanup(job_id: str):
+    folder = os.path.join(JOB_AUDIO_DIR, job_id)
+    try:
+        if os.path.isdir(folder):
+            for n in os.listdir(folder):
+                try:
+                    os.remove(os.path.join(folder, n))
+                except OSError:
+                    pass
+            os.rmdir(folder)
+    except OSError:
+        pass
+
+
+def _run_job(job_id: str, email: str, segment_seconds: float):
+    """Diarise each staged chunk, offsetting it into whole-recording time."""
+    try:
+        doc = get_jobs_container().read_item(item=job_id, partition_key=email)
+    except Exception:
+        traceback.print_exc()
+        return
+
+    doc["status"] = "processing"
+    doc["started_at"] = datetime.now(timezone.utc).isoformat()
+    _job_save(doc)
+
+    try:
+        paths = _job_audio_paths(job_id)
+        if not paths:
+            raise RuntimeError("The uploaded audio is no longer on disk.")
+
+        segments: List[dict] = []
+        for i, path in enumerate(paths):
+            with open(path, "rb") as fh:
+                audio = fh.read()
+            if not audio:
+                continue
+            offset = i * float(segment_seconds or 0)
+            for seg in _run_diarization(
+                audio, os.path.basename(path), doc.get("content_type") or "audio/ogg"
+            ):
+                seg = dict(seg)
+                seg["start"] = round(float(seg.get("start", 0.0)) + offset, 3)
+                seg["end"] = round(float(seg.get("end", 0.0)) + offset, 3)
+                if isinstance(seg.get("words"), list):
+                    seg["words"] = [
+                        {
+                            "word": w.get("word", ""),
+                            "start": round(float(w.get("start", 0.0)) + offset, 3),
+                            "end": round(float(w.get("end", 0.0)) + offset, 3),
+                        }
+                        for w in seg["words"]
+                    ]
+                segments.append(seg)
+
+        doc["segments"] = segments
+        doc["words_dropped"] = False
+        # Shed word timings before the whole result becomes unsavable.
+        if len(json.dumps(doc)) > JOB_DOC_SOFT_LIMIT:
+            for seg in doc["segments"]:
+                seg.pop("words", None)
+            doc["words_dropped"] = True
+
+        doc["status"] = "completed"
+        doc["error"] = None
+    except Exception as exc:
+        traceback.print_exc()
+        doc["status"] = "failed"
+        doc["error"] = _friendly_diarize_error(exc)
+        doc["segments"] = []
+    finally:
+        doc["completed_at"] = datetime.now(timezone.utc).isoformat()
+        _job_save(doc)
+        _job_cleanup(job_id)
+
+
+def _fail_orphaned_jobs():
+    """Jobs still marked running at boot lost their audio when we restarted.
+
+    Without this they sit at "processing" forever, because the thread that
+    owned them no longer exists.
+    """
+    try:
+        cont = get_jobs_container()
+        stale = list(
+            cont.query_items(
+                "SELECT * FROM c WHERE c.status = 'queued' OR c.status = 'processing'",
+                enable_cross_partition_query=True,
+            )
+        )
+    except Exception:
+        return
+    for doc in stale:
+        doc["status"] = "failed"
+        doc["error"] = (
+            "The server restarted while this was processing. Please run it again."
+        )
+        doc["completed_at"] = datetime.now(timezone.utc).isoformat()
+        _job_save(doc)
+    if stale:
+        print(f"[jobs] failed {len(stale)} job(s) orphaned by a restart")
+
+
+@app.on_event("startup")
+def _jobs_startup():
+    try:
+        os.makedirs(JOB_AUDIO_DIR, exist_ok=True)
+    except OSError:
+        pass
+    _fail_orphaned_jobs()
+
+
+@app.post("/jobs/diarize")
+async def create_diarize_job(
+    files: List[UploadFile] = File(...),
+    duration_sec: float = Form(0.0),
+    segment_seconds: float = Form(1400.0),
+    topic_guess: str = Form("Background diarisation"),
+    meeting_id: str = Form(""),
+    user: dict = Depends(get_current_user),
+):
+    """Stage the audio, record the job, start work, and return immediately."""
+    email = user.get("sub") or user.get("email") or ""
+    if not email:
+        raise HTTPException(status_code=401, detail="Could not identify the account.")
+    if not files:
+        raise HTTPException(status_code=400, detail="No audio was uploaded.")
+
+    job_id = str(uuid.uuid4())
+    folder = os.path.join(JOB_AUDIO_DIR, job_id)
+    os.makedirs(folder, exist_ok=True)
+
+    total = 0
+    content_type = None
+    for i, up in enumerate(files):
+        data = await up.read()
+        if not data:
+            continue
+        total += len(data)
+        # Azure picks the decoder from the file extension and rejects unknown
+        # ones outright ("Unsupported file format bin"), so the uploaded
+        # extension has to survive staging. Zero-padded so listdir() sorts
+        # back into recording order.
+        ext = os.path.splitext(up.filename or "")[1].lower()
+        if not ext or len(ext) > 6:
+            ext = ".ogg"
+        if content_type is None and up.content_type:
+            content_type = up.content_type
+        with open(os.path.join(folder, "%04d%s" % (i, ext)), "wb") as fh:
+            fh.write(data)
+    if total == 0:
+        _job_cleanup(job_id)
+        raise HTTPException(status_code=400, detail="The uploaded audio was empty.")
+
+    doc = {
+        "id": job_id,
+        "email": email,
+        "status": "queued",
+        "topic": topic_guess or "Background diarisation",
+        "meeting_id": meeting_id or "",
+        "duration_sec": duration_sec or 0.0,
+        "segment_seconds": segment_seconds or 0.0,
+        "content_type": content_type or "audio/ogg",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "started_at": None,
+        "completed_at": None,
+        "error": None,
+        "segments": [],
+        "acked": False,
+    }
+    get_jobs_container().create_item(doc)
+
+    threading.Thread(
+        target=_run_job,
+        args=(job_id, email, segment_seconds or 0.0),
+        daemon=True,
+    ).start()
+
+    return {"status": "success", "job_id": job_id, "job": _job_public(doc)}
+
+
+@app.get("/jobs/diarize/pending")
+def list_pending_diarize_jobs(user: dict = Depends(get_current_user)):
+    """Every job this account has not acknowledged yet, oldest first."""
+    email = user.get("sub") or user.get("email") or ""
+    if not email:
+        raise HTTPException(status_code=401, detail="Could not identify the account.")
+    try:
+        docs = list(
+            get_jobs_container().query_items(
+                "SELECT * FROM c WHERE c.email = @e AND c.acked = false "
+                "ORDER BY c.created_at ASC",
+                parameters=[{"name": "@e", "value": email}],
+                enable_cross_partition_query=True,
+            )
+        )
+    except Exception:
+        traceback.print_exc()
+        return {"status": "success", "jobs": []}
+    return {"status": "success", "jobs": [_job_public(d) for d in docs]}
+
+
+@app.post("/jobs/diarize/{job_id}/ack")
+def ack_diarize_job(job_id: str, user: dict = Depends(get_current_user)):
+    """Mark a finished job as consumed so it stops being handed out."""
+    email = user.get("sub") or user.get("email") or ""
+    try:
+        doc = get_jobs_container().read_item(item=job_id, partition_key=email)
+    except Exception:
+        raise HTTPException(status_code=404, detail="That job does not exist.")
+    doc["acked"] = True
+    _job_save(doc)
+    return {"status": "success"}
 
 
 @app.get("/")
