@@ -2,7 +2,15 @@
 import { useState, useEffect, useMemo, useRef } from "react";
 import Calendar from "react-calendar";
 import "react-calendar/dist/Calendar.css";
-import { Download, CalendarDays, Clock, Highlighter, Copy } from "lucide-react";
+import {
+  Download,
+  CalendarDays,
+  Clock,
+  Highlighter,
+  Copy,
+  Sparkles,
+  X,
+} from "lucide-react";
 import HighlightedText, {
   highlightRanges,
 } from "@/components/ui/HighlightedText";
@@ -13,6 +21,8 @@ import {
   MEETINGS_EVENT,
 } from "@/lib/meetingStore";
 import { diarizeAudioFile } from "@/lib/diarize";
+import { summarizeTranscript } from "@/lib/summary";
+import SummaryText from "@/components/ui/SummaryText";
 import AudioPlayer from "@/components/ui/AudioPlayer";
 
 type TranscriptEntry = { speaker: string; text: string; timestamp: string };
@@ -102,6 +112,12 @@ export default function MyMeetings() {
   const [detailView, setDetailView] = useState<"transcript" | "diarize">(
     "diarize",
   );
+  // AI summary panel, shown beside the transcript card.
+  const [showSummary, setShowSummary] = useState(false);
+  const [summaryText, setSummaryText] = useState("");
+  const [summarising, setSummarising] = useState(false);
+  const [summaryError, setSummaryError] = useState<string | null>(null);
+  const summaryAbortRef = useRef<AbortController | null>(null);
   const [showDiarizeConfirm, setShowDiarizeConfirm] = useState(false);
   const [diarizing, setDiarizing] = useState(false);
   const [diarizeProgress, setDiarizeProgress] = useState(0);
@@ -109,6 +125,75 @@ export default function MyMeetings() {
   // Keep the backend's plain-English reason (quota used up, service busy,
   // credentials rejected) so the modal can name the actual problem.
   const [diarizeError, setDiarizeError] = useState<string | null>(null);
+
+  /** Close the panel and abort an in-flight request so it cannot land later. */
+  const closeSummary = () => {
+    summaryAbortRef.current?.abort();
+    summaryAbortRef.current = null;
+    setShowSummary(false);
+    setSummarising(false);
+    setSummaryText("");
+    setSummaryError(null);
+  };
+
+  const handleSummarise = async () => {
+    if (!selectedMeeting || summarising) return;
+
+    // Already have one for this meeting: just reopen it rather than paying for
+    // the same completion twice.
+    if (summaryText && showSummary) return;
+    if (summaryText) {
+      setShowSummary(true);
+      return;
+    }
+
+    // Summarise what is actually on screen, so a diarised view is summarised
+    // with its speaker labels intact.
+    const rows = getDiarizedRows(selectedMeeting);
+    const text =
+      detailView === "diarize" && rows
+        ? rows.map((r) => `${r.speaker}: ${r.text}`).join("\n\n")
+        : getPlainText(selectedMeeting);
+
+    setShowSummary(true);
+    setSummaryError(null);
+    setSummarising(true);
+
+    const controller = new AbortController();
+    summaryAbortRef.current = controller;
+    try {
+      const summary = await summarizeTranscript(text, {
+        jwt: localStorage.getItem("token"),
+        meetingId: selectedMeeting.id,
+        signal: controller.signal,
+      });
+      if (controller.signal.aborted) return;
+      setSummaryText(summary);
+    } catch (e: any) {
+      if (controller.signal.aborted || e?.name === "AbortError") return;
+      setSummaryError(
+        typeof e?.message === "string" && e.message.trim()
+          ? e.message.trim()
+          : "Could not summarise this meeting.",
+      );
+    } finally {
+      if (!controller.signal.aborted) setSummarising(false);
+      if (summaryAbortRef.current === controller) summaryAbortRef.current = null;
+    }
+  };
+
+  // A summary belongs to one meeting. Closing the modal by any route (the X,
+  // the backdrop, Escape) or switching to another meeting must drop it, or the
+  // next meeting opens showing the previous one's summary.
+  const openMeetingId = selectedMeeting?.id ?? null;
+  useEffect(() => {
+    summaryAbortRef.current?.abort();
+    summaryAbortRef.current = null;
+    setShowSummary(false);
+    setSummarising(false);
+    setSummaryText("");
+    setSummaryError(null);
+  }, [openMeetingId]);
 
   const [mtgHighlights, setMtgHighlights] = useState<string[]>([]);
   const [mtgShowHighlights, setMtgShowHighlights] = useState(true);
@@ -293,7 +378,10 @@ export default function MyMeetings() {
         e.preventDefault();
         searchInputRef.current?.focus();
       }
-      if (e.key === "Escape" && selectedMeeting) setSelectedMeeting(null);
+      if (e.key === "Escape" && selectedMeeting) {
+        setSelectedMeeting(null);
+        closeSummary();
+      }
       if (e.key === "Escape" && isCalendarOpen) setIsCalendarOpen(false);
     };
     document.addEventListener("keydown", handleKeyDown);
@@ -838,10 +926,21 @@ export default function MyMeetings() {
       {selectedMeeting && (
         <div
           className="fixed inset-0 z-50 bg-slate-900/40 flex items-center justify-center p-6 backdrop-blur-sm"
-          onClick={() => setSelectedMeeting(null)}
+          onClick={() => {
+            setSelectedMeeting(null);
+            closeSummary();
+          }}
         >
+          {/* Centred flex row: opening the summary adds a sibling, so the
+              transcript card slides left on its own and both keep the same
+              max width instead of one squashing the other. */}
           <div
-            className="bg-white rounded-2xl w-full max-w-3xl max-h-[85vh] flex flex-col shadow-2xl"
+            className={`flex w-full items-stretch justify-center gap-4 transition-all duration-300 ${
+              showSummary ? "max-w-[76rem]" : "max-w-3xl"
+            }`}
+          >
+          <div
+            className="bg-white rounded-2xl w-full max-w-3xl max-h-[85vh] flex flex-1 flex-col shadow-2xl"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="p-6 border-b border-white/20 flex justify-between items-center bg-linear-to-r from-violet-500 to-blue-500 rounded-t-2xl">
@@ -955,6 +1054,24 @@ export default function MyMeetings() {
                       ? "Transcript"
                       : "Diarise"}
                 </span>
+              </button>
+              <button
+                onClick={() =>
+                  showSummary ? closeSummary() : void handleSummarise()
+                }
+                disabled={summarising}
+                className={`flex shrink-0 items-center gap-1.5 rounded-lg px-4 py-1.5 text-xs font-semibold shadow-sm transition-all disabled:cursor-not-allowed disabled:opacity-60 ${
+                  showSummary
+                    ? "bg-slate-200 text-slate-700 hover:bg-slate-300"
+                    : "bg-linear-to-r from-indigo-500 to-violet-500 text-white hover:from-indigo-600 hover:to-violet-600"
+                }`}
+              >
+                <Sparkles className="h-3.5 w-3.5" />
+                {summarising
+                  ? "Summarising…"
+                  : showSummary
+                    ? "Hide Summary"
+                    : "AI Summary"}
               </button>
             </div>
 
@@ -1152,6 +1269,89 @@ export default function MyMeetings() {
                 })()
               )}
             </div>
+          </div>
+
+          {showSummary && (
+            <div
+              className="flex max-h-[85vh] w-full max-w-3xl flex-1 flex-col rounded-2xl bg-white shadow-2xl"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="flex items-center justify-between rounded-t-2xl bg-linear-to-r from-indigo-500 to-violet-500 p-6">
+                <h2 className="flex items-center gap-2 text-xl font-bold text-white">
+                  <Sparkles className="h-5 w-5" />
+                  AI Summary
+                </h2>
+                <div className="flex items-center gap-2">
+                  {summaryText && !summarising && (
+                    <button
+                      onClick={() => {
+                        void navigator.clipboard
+                          ?.writeText(summaryText)
+                          .catch(() => {});
+                      }}
+                      title="Copy summary"
+                      className="rounded-lg p-2 text-white/90 transition-colors hover:bg-white/20"
+                    >
+                      <Copy className="h-4 w-4" />
+                    </button>
+                  )}
+                  <button
+                    onClick={closeSummary}
+                    title="Close summary"
+                    className="rounded-lg p-2 text-white/90 transition-colors hover:bg-white/20"
+                  >
+                    <X className="h-5 w-5" />
+                  </button>
+                </div>
+              </div>
+
+              <div className="flex-1 overflow-y-auto p-6">
+                {summarising ? (
+                  <div className="space-y-3">
+                    <p className="text-sm font-semibold text-slate-500">
+                      Reading the transcript…
+                    </p>
+                    <p className="text-xs text-slate-400">
+                      The first request can take longer while the service wakes
+                      up.
+                    </p>
+                    <div className="mt-4 space-y-2">
+                      {[0, 1, 2, 3, 4].map((i) => (
+                        <div
+                          key={i}
+                          className="h-3 animate-pulse rounded bg-slate-100"
+                          style={{ width: `${95 - i * 12}%` }}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                ) : summaryError ? (
+                  <div>
+                    <p className="text-sm font-semibold text-rose-600">
+                      Could not summarise this meeting
+                    </p>
+                    <p className="mt-2 text-xs leading-relaxed text-slate-500">
+                      {summaryError}
+                    </p>
+                    <button
+                      onClick={() => {
+                        setSummaryError(null);
+                        setSummaryText("");
+                        void handleSummarise();
+                      }}
+                      className="mt-5 rounded-xl bg-slate-100 px-4 py-2 text-xs font-bold text-slate-700 transition-colors hover:bg-slate-200"
+                    >
+                      Try again
+                    </button>
+                  </div>
+                ) : summaryText ? (
+                  <SummaryText text={summaryText} />
+                ) : (
+                  <p className="text-sm text-slate-400">No summary yet.</p>
+                )}
+              </div>
+            </div>
+          )}
           </div>
         </div>
       )}

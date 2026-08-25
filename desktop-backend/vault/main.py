@@ -1151,6 +1151,100 @@ async def transcribe_stream(
     return {"status": "success", "text": text}
 
 
+# Roughly 15k tokens of transcript. Long meetings are trimmed head+tail rather
+# than truncated, because the closing minutes usually carry the decisions and
+# action items that make a summary worth reading.
+SUMMARY_MAX_CHARS = 60000
+
+SUMMARY_SYSTEM_PROMPT = (
+    "You summarise meeting transcripts. Produce a clear, factual summary in "
+    "markdown with these sections, omitting any section that has no content:\n\n"
+    "## Overview\n"
+    "Two or three sentences on what the meeting was about.\n\n"
+    "## Key Points\n"
+    "Bullet points of what was discussed.\n\n"
+    "## Decisions\n"
+    "Bullet points of what was actually decided.\n\n"
+    "## Action Items\n"
+    "Bullet points of who agreed to do what. Name the person when the "
+    "transcript makes it clear, and do not invent an owner when it does not.\n\n"
+    "Use only what the transcript supports and never invent details. If the "
+    "transcript is too short or too garbled to summarise, say so plainly "
+    "instead of padding."
+)
+
+
+def _run_summary(transcript: str) -> str:
+    """Summarise a transcript with a chat completion.
+
+    This needs a CHAT deployment. AZURE_TRANSCRIBE_DEPLOYMENT and
+    AZURE_DIARIZE_DEPLOYMENT are both audio models and cannot do this, and the
+    gateway serves no chat deployment today, so set AZURE_SUMMARY_DEPLOYMENT to
+    the name of a chat deployment such as gpt-4o.
+    """
+    client = build_openai_client()
+    deployment = (
+        secret("AZURE_SUMMARY_DEPLOYMENT")
+        or secret("AZURE_CHAT_DEPLOYMENT")
+        or "gpt-4o"
+    ).strip()
+
+    text = transcript.strip()
+    if len(text) > SUMMARY_MAX_CHARS:
+        half = SUMMARY_MAX_CHARS // 2
+        text = (
+            text[:half]
+            + "\n\n[... middle of the transcript omitted for length ...]\n\n"
+            + text[-half:]
+        )
+
+    resp = client.chat.completions.create(
+        model=deployment,
+        messages=[
+            {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
+            {"role": "user", "content": text},
+        ],
+        temperature=0.2,
+    )
+    choices = getattr(resp, "choices", None) or []
+    if not choices:
+        raise HTTPException(status_code=502, detail="The model returned no summary.")
+    return (choices[0].message.content or "").strip()
+
+
+class SummarizeRequest(BaseModel):
+    text: str
+    meeting_id: str = ""
+
+
+@app.post("/summarize")
+async def summarize(
+    req: SummarizeRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Summarise a transcript. Takes the plain or the speaker-labelled text."""
+    text = (req.text or "").strip()
+    if not text:
+        raise HTTPException(
+            status_code=400, detail="There is no transcript to summarise."
+        )
+    if len(text) < 40:
+        raise HTTPException(
+            status_code=400, detail="This transcript is too short to summarise."
+        )
+    try:
+        summary = await asyncio.to_thread(_run_summary, text)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        traceback.print_exc()
+        return {"status": "error", "message": _friendly_diarize_error(exc)}
+
+    if not summary:
+        return {"status": "error", "message": "The model returned an empty summary."}
+    return {"status": "success", "summary": summary}
+
+
 @app.get("/")
 async def root():
     return {"status": "ok", "message": "ThreadNotes Cloud Vault is running."}
