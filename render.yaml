@@ -8,42 +8,47 @@ services:
     startCommand: uvicorn --app-dir desktop-backend/vault main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /
     envVars:
+      # The pinned deps (pydantic 2.9.2, httpx 0.24.1) predate Python 3.13 and
+      # have no wheels for it. Match the 3.11 the Dockerfile used.
+      - key: PYTHON_VERSION
+        value: 3.11.9
+
       - key: JWT_SECRET
         generateValue: true
 
-      # --- Azure Speech (live transcription tokens) ---
-      - key: AZURE_SPEECH_KEY
+      # --- AI Gateway ---------------------------------------------------------
+      # Every Azure + Cosmos secret is fetched from the gateway once at startup
+      # by desktop-backend/vault/gateway_credentials.py. That is why none of
+      # AZURE_* / COSMOS_* appear below: setting them here would be ignored in
+      # favour of the gateway, and they are commented out in .env for the same
+      # reason. GATEWAY_PROVIDERS supplies:
+      #   Cosmosdb       -> COSMOS_KEY, COSMOS_ENDPOINT, COSMOS_DATABASE,
+      #                     COSMOS_USERS_CONTAINER
+      #   AzureOpenAI    -> AZURE_OPENAI_KEY, AZURE_OPENAI_ENDPOINT,
+      #                     AZURE_TRANSCRIBE_DEPLOYMENT, AZURE_DIARIZE_DEPLOYMENT
+      #   AzureSpeechKey -> AZURE_SPEECH_KEY, AZURE_SPEECH_REGION
+      - key: DXAI_API_KEY
         sync: false
-      - key: AZURE_SPEECH_REGION
-        value: swedencentral
+      - key: DXAI_BASE_URL
+        value: https://ai-gateway-platform-cex4.onrender.com
+      - key: GATEWAY_PROVIDERS
+        value: Cosmosdb,AzureOpenAI,AzureSpeechKey
+      - key: GATEWAY_TIMEOUT
+        value: "60"
+      - key: GATEWAY_PROXY_AI
+        value: "false"
+      - key: GATEWAY_AI_PROVIDER
+        value: AzureOpenAI
 
-      # --- Azure OpenAI (diarization + transcription proxy) ---
-      - key: AZURE_OPENAI_KEY
+      # --- Email (Brevo HTTP API; Render's free tier blocks outbound SMTP) -----
+      - key: BREVO_API_KEY
         sync: false
-      - key: AZURE_OPENAI_ENDPOINT
+      - key: BREVO_SENDER_EMAIL
         sync: false
-      - key: AZURE_OPENAI_API_VERSION
-        value: 2025-04-01-preview
-      - key: AZURE_DIARIZE_DEPLOYMENT
-        value: gpt-4o-transcribe-diarize
-      - key: AZURE_TRANSCRIBE_DEPLOYMENT
-        value: gpt-4o-transcribe
+      - key: BREVO_SENDER_NAME
+        value: ThreadNotes
 
-      # --- Azure Cosmos DB (user accounts) ---
-      - key: COSMOS_ENDPOINT
-        sync: false
-      - key: COSMOS_KEY
-        sync: false
-      - key: COSMOS_DATABASE
-        sync: false
-      - key: COSMOS_USERS_CONTAINER
-        value: users
-
-      # --- Gmail OTP (From address; OAuth creds live in credentials.json / token.json) ---
-      - key: GMAIL_SENDER
-        sync: false
-
-      # --- Admin web panel credentials ---
+      # --- Admin web panel credentials ---------------------------------------
       - key: ADMIN_EMAIL
         sync: false
       - key: ADMIN_PASSWORD
