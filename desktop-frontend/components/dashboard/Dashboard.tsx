@@ -25,6 +25,11 @@ import {
 } from "@/lib/meetingStore";
 import { getUserName, clearSession } from "@/lib/auth";
 import { diarizeAudioFile, transcribeAudioFile } from "@/lib/diarize";
+import {
+  createDiariseJob,
+  fetchPendingJobs,
+  ackJob,
+} from "@/lib/diarizeJobs";
 import ConfirmModal from "@/components/ui/ConfirmModal";
 import ScrollNav from "@/components/ui/ScrollNav";
 import AudioPlayer from "@/components/ui/AudioPlayer";
@@ -180,11 +185,10 @@ export default function Dashboard() {
   // timings so the transcript view highlights in sync like the diarize view.
   const [showDiariseMenu, setShowDiariseMenu] = useState(false);
   const diariseMenuRef = useRef<HTMLDivElement | null>(null);
-  // Background diarisation is tracked separately from isDiarizing on purpose:
-  // isDiarizing disables recording and upload across the app, which is exactly
-  // what "in background" is meant to avoid.
+  // Tracks only the upload leg of a background job. Kept separate from
+  // isDiarizing because that flag disables recording and upload app-wide, and
+  // a background job must not lock anything.
   const [bgDiarising, setBgDiarising] = useState(false);
-  const [bgDiariseProgress, setBgDiariseProgress] = useState(0);
   const [transcriptParts, setTranscriptParts] = useState<string[]>([]);
   const [transcriptSegmentSeconds, setTranscriptSegmentSeconds] = useState(300);
   const [resolvedAudioDuration, setResolvedAudioDuration] = useState(0);
@@ -727,57 +731,48 @@ export default function Dashboard() {
   ]);
 
   /**
-   * Same work as handleDiarizeRetry, but deliberately never sets isDiarizing,
-   * because that flag disables recording and file upload across the app (see
-   * CaptureControls) — locking the UI is precisely what "in background" exists
-   * to avoid. Progress is tracked in its own state for the same reason.
+   * Hand the whole recording to the vault as a background job.
    *
-   * The result is always written to disk via saveTranscriptLocally, which takes
-   * the rows as an argument and so does not depend on the session still being
-   * current. It is only applied to the on-screen transcript when the user has
-   * not moved on to another recording in the meantime.
+   * This uploads every chunk in one request and returns as soon as the server
+   * has the audio, so the desktop app -- or the whole laptop -- can be closed
+   * straight afterwards. The vault owns the work from that point, writes the
+   * result to Cosmos, and the next launch collects it (see the pending-jobs
+   * sweep below).
+   *
+   * An earlier version of this ran diarizeAudioFile in the renderer without
+   * setting isDiarizing. That only avoided locking the UI; the work still died
+   * with the app, which is not what "in background" means to anyone.
    */
+  // Name the job after its opening words, the same shape handleSaveTranscript
+  // uses, so a collected result is recognisable in MyMeetings later.
+  const bgJobTopic = useMemo(() => {
+    const words = transcriptText.trim().split(/\s+/).filter(Boolean).slice(0, 6);
+    return words.length ? words.join(" ") : "Background diarisation";
+  }, [transcriptText]);
+
   const handleDiariseInBackground = useCallback(async () => {
     if (!audioFilePath || isDiarizing || bgDiarising || mergedTranscript.length > 0) {
       return;
     }
-    const sid = sessionIdRef.current;
     setDiarizeError(null);
     setBgDiarising(true);
-    setBgDiariseProgress(2);
-    setStatusMessage("Separating speakers in the background — carry on.");
+    setStatusMessage("Uploading audio for background diarisation…");
     try {
-      const rows = (await diarizeAudioFile(audioFilePath, {
+      await createDiariseJob(audioFilePath, {
         jwt: localStorage.getItem("token"),
-        onProgress: (done, total) => {
-          const t = total > 0 ? total : 1;
-          setBgDiariseProgress(Math.max(2, (done / t) * 100));
-        },
-      })) as MergedTranscriptRow[];
-
-      setBgDiariseProgress(100);
-      void saveTranscriptLocally(rows);
-
-      if (sid === sessionIdRef.current) {
-        setMergedTranscript(rows);
-        setTranscriptView("diarize");
-        setIsSaved(false);
-        setStatusMessage("Speakers separated — click Save to keep it.");
-      } else {
-        // They started something else while this ran, so dropping the rows into
-        // the live view would overwrite unrelated work. The file on disk keeps
-        // the result either way.
-        setStatusMessage(
-          "Background diarisation finished and was saved to your transcripts folder.",
-        );
-      }
+        topic: bgJobTopic,
+        meetingId: savedMeetingId || "",
+        durationSec: playbackDurationSec || sessionTime || 0,
+      });
+      setStatusMessage(
+        "Diarising in the background — you can close the app. " +
+          "The speakers will be waiting in MyMeetings.",
+      );
     } catch (e: any) {
       const reason = typeof e?.message === "string" ? e.message.trim() : "";
-      setBgDiariseProgress(0);
-      // No retry modal here: a modal would seize the screen the user asked to
-      // keep working on. The Diarise button stays available to try again.
+      // No retry modal: it would seize the screen the user asked to keep using.
       setStatusMessage(
-        `⚠️ ${reason || "Background diarisation failed"} — you can try Diarise again.`,
+        `⚠️ ${reason || "Could not start the background job"} — you can try Diarise again.`,
       );
     } finally {
       setBgDiarising(false);
@@ -787,8 +782,87 @@ export default function Dashboard() {
     isDiarizing,
     bgDiarising,
     mergedTranscript.length,
-    saveTranscriptLocally,
+    savedMeetingId,
+    bgJobTopic,
+    playbackDurationSec,
+    sessionTime,
   ]);
+
+  /**
+   * Collect finished background jobs, once per launch.
+   *
+   * Results are written into the meeting store rather than the live view: by
+   * the time a job lands the user is usually somewhere else entirely, and
+   * overwriting whatever is on screen would destroy unrelated work. A job is
+   * only acked after its rows are stored, so a crash mid-save leaves it
+   * pending and it is collected again next time.
+   */
+  useEffect(() => {
+    const token =
+      typeof window !== "undefined" ? localStorage.getItem("token") : null;
+    if (!token) return;
+    let cancelled = false;
+
+    (async () => {
+      const jobs = await fetchPendingJobs(token).catch(() => []);
+      if (cancelled || jobs.length === 0) return;
+
+      let collected = 0;
+      let failed = 0;
+      for (const job of jobs) {
+        if (job.status === "queued" || job.status === "processing") continue;
+
+        if (job.status === "failed") {
+          failed += 1;
+          await ackJob(job.job_id, token);
+          continue;
+        }
+
+        const rows = job.segments ?? [];
+        if (rows.length === 0) {
+          await ackJob(job.job_id, token);
+          continue;
+        }
+
+        try {
+          addMeeting({
+            id: job.meeting_id || `job-${job.job_id}`,
+            topic: job.topic || "Background diarisation",
+            date: job.completed_at || job.created_at || new Date().toISOString(),
+            transcript: rows.map((r) => ({
+              speaker: r.speaker,
+              text: r.text,
+              timestamp: "",
+            })),
+            durationSec: job.duration_sec || 0,
+            plainText: rows.map((r) => r.text).join("\n\n"),
+            diarized: rows,
+          } as any);
+          collected += 1;
+          await ackJob(job.job_id, token);
+        } catch {
+          // Leave it unacked so the next launch retries.
+        }
+      }
+
+      if (cancelled) return;
+      if (collected > 0) {
+        setStatusMessage(
+          collected === 1
+            ? "A background diarisation finished — it is in MyMeetings."
+            : `${collected} background diarisations finished — they are in MyMeetings.`,
+        );
+      } else if (failed > 0) {
+        setStatusMessage(
+          "A background diarisation did not finish. Please run it again.",
+        );
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Close the Diarise dropdown on an outside click or Escape.
   useEffect(() => {
@@ -1520,7 +1594,7 @@ export default function Dashboard() {
                                 {isDiarizing
                                   ? "Diarising…"
                                   : bgDiarising
-                                    ? `Diarising… ${Math.round(bgDiariseProgress)}%`
+                                    ? "Uploading…"
                                     : "Diarise"}
                                 <ChevronDown
                                   className={`h-3.5 w-3.5 transition-transform ${
@@ -1562,7 +1636,8 @@ export default function Dashboard() {
                                       Diarise in background
                                     </span>
                                     <span className="mt-0.5 block text-[10px] leading-snug text-slate-400">
-                                      Keep recording or uploading while it runs
+                                      Runs on the server — you can close the
+                                      app and collect it later
                                     </span>
                                   </button>
                                 </div>
