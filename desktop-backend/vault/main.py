@@ -1174,20 +1174,30 @@ SUMMARY_SYSTEM_PROMPT = (
 )
 
 
-def _run_summary(transcript: str) -> str:
-    """Summarise a transcript with a chat completion.
+GEMINI_API_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+)
 
-    This needs a CHAT deployment. AZURE_TRANSCRIBE_DEPLOYMENT and
-    AZURE_DIARIZE_DEPLOYMENT are both audio models and cannot do this, and the
-    gateway serves no chat deployment today, so set AZURE_SUMMARY_DEPLOYMENT to
-    the name of a chat deployment such as gpt-4o.
+
+def _run_summary(transcript: str) -> str:
+    """Summarise a transcript with Gemini.
+
+    Azure OpenAI cannot do this job: the gateway's AzureOpenAI profile exposes
+    only AZURE_TRANSCRIBE_DEPLOYMENT and AZURE_DIARIZE_DEPLOYMENT, both audio
+    models with no chat capability. The gateway's `gemini` profile carries the
+    key, under the variable name `api_key` -- so "gemini" must appear in
+    GATEWAY_PROVIDERS or the key never reaches this process.
     """
-    client = build_openai_client()
-    deployment = (
-        secret("AZURE_SUMMARY_DEPLOYMENT")
-        or secret("AZURE_CHAT_DEPLOYMENT")
-        or "gpt-4o"
-    ).strip()
+    key = (secret("GEMINI_API_KEY") or secret("api_key")).strip()
+    if not key:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "No Gemini API key available. Add 'gemini' to GATEWAY_PROVIDERS "
+                "so the vault fetches it at startup, or set GEMINI_API_KEY."
+            ),
+        )
+    model = secret("GEMINI_SUMMARY_MODEL", "gemini-3.6-flash").strip()
 
     text = transcript.strip()
     if len(text) > SUMMARY_MAX_CHARS:
@@ -1198,18 +1208,67 @@ def _run_summary(transcript: str) -> str:
             + text[-half:]
         )
 
-    resp = client.chat.completions.create(
-        model=deployment,
-        messages=[
-            {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
-            {"role": "user", "content": text},
-        ],
-        temperature=0.2,
-    )
-    choices = getattr(resp, "choices", None) or []
-    if not choices:
-        raise HTTPException(status_code=502, detail="The model returned no summary.")
-    return (choices[0].message.content or "").strip()
+    payload = {
+        "systemInstruction": {"parts": [{"text": SUMMARY_SYSTEM_PROMPT}]},
+        "contents": [{"role": "user", "parts": [{"text": text}]}],
+        "generationConfig": {"temperature": 0.2},
+    }
+
+    try:
+        # The key goes in a header, NOT the ?key= query parameter Google also
+        # accepts. httpx logs the full request URL at INFO level and Render
+        # captures stdout, so a query-string key would be printed into the
+        # production logs on every single summary request.
+        resp = httpx.post(
+            GEMINI_API_URL.format(model=model),
+            headers={"x-goog-api-key": key},
+            json=payload,
+            timeout=180.0,
+        )
+    except httpx.RequestError as exc:
+        print(f"CRITICAL GEMINI ERROR: {exc!r}")
+        raise HTTPException(status_code=502, detail=f"Could not reach Gemini: {exc}")
+
+    if resp.status_code >= 400:
+        # The body names the real cause (retired model, bad key, quota), so log
+        # it, but do not hand the raw provider text to the client.
+        print(f"CRITICAL GEMINI ERROR: HTTP {resp.status_code} - {resp.text[:400]}")
+        if resp.status_code == 404:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"Gemini model '{model}' is unavailable to this key. Set "
+                    "GEMINI_SUMMARY_MODEL to a model the key can use."
+                ),
+            )
+        raise HTTPException(
+            status_code=502,
+            detail=f"Gemini rejected the request (HTTP {resp.status_code}).",
+        )
+
+    data = resp.json()
+    candidates = data.get("candidates") or []
+    if not candidates:
+        blocked = (data.get("promptFeedback") or {}).get("blockReason")
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Gemini returned no summary (blocked: {blocked})."
+                if blocked
+                else "Gemini returned no summary."
+            ),
+        )
+
+    cand = candidates[0]
+    parts = (cand.get("content") or {}).get("parts") or []
+    out = "".join(p.get("text", "") for p in parts).strip()
+    if not out:
+        reason = cand.get("finishReason") or "unknown"
+        raise HTTPException(
+            status_code=502,
+            detail=f"Gemini returned an empty summary (finishReason: {reason}).",
+        )
+    return out
 
 
 class SummarizeRequest(BaseModel):

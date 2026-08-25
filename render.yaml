@@ -32,7 +32,7 @@ services:
       - key: DXAI_BASE_URL
         value: https://ai-gateway-platform-cex4.onrender.com
       - key: GATEWAY_PROVIDERS
-        value: Cosmosdb,AzureOpenAI,AzureSpeechKey
+        value: Cosmosdb,AzureOpenAI,AzureSpeechKey,gemini
       - key: GATEWAY_TIMEOUT
         value: "60"
       - key: GATEWAY_PROXY_AI
