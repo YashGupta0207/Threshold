@@ -134,7 +134,7 @@ export default function CaptureControls({
           <div className="mt-3">
             <div className="mb-1 flex items-center justify-between">
               <span className="text-[11px] font-semibold uppercase tracking-wider text-violet-500">
-                Diarizing
+                Diarising
               </span>
               <span className="font-mono text-xs font-bold tabular-nums text-slate-600">
                 {Math.round(Math.min(100, Math.max(0, diarizeProgress)))}%

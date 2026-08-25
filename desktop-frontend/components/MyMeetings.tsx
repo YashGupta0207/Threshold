@@ -208,7 +208,7 @@ export default function MyMeetings() {
     const exportRows = rows.map((r) => ({ speaker: r.speaker, text: r.text }));
     const plainText = getPlainText(meeting);
     const base = meeting.topic.replace(/[^a-z0-9]/gi, "_") || "Transcript";
-    const kind = view === "diarize" ? "Diarized" : "Transcript";
+    const kind = view === "diarize" ? "Diarised" : "Transcript";
     const defaultName = `${base}_${kind}.txt`;
 
     const api = typeof window !== "undefined" ? window.electronAPI : undefined;
@@ -515,7 +515,7 @@ export default function MyMeetings() {
       setSelectedMeeting(updated);
       setDiarizing(false);
       setDetailView("diarize");
-      showToast("Diarization complete");
+      showToast("Diarisation complete");
     } catch (e: any) {
       stopCreep();
       setDiarizing(false);
@@ -652,8 +652,8 @@ export default function MyMeetings() {
                   { key: "today", label: "Today" },
                   { key: "week", label: "This Week" },
                   { key: "month", label: "This Month" },
-                  { key: "diarized", label: "Diarized" },
-                  { key: "not-diarized", label: "Not Diarized" },
+                  { key: "diarized", label: "Diarised" },
+                  { key: "not-diarized", label: "Not Diarised" },
                 ] as const
               ).map((f) => (
                 <button
@@ -947,13 +947,13 @@ export default function MyMeetings() {
                 )}
                 <span className="relative">
                   {/* Label names the view you get by clicking, so it flips each
-                      time. On the transcript it reads "Diarize" whether the
+                      time. On the transcript it reads "Diarise" whether the
                       speakers are already separated or still have to be. */}
                   {diarizing
-                    ? `Diarizing… ${Math.round(diarizeProgress)}%`
+                    ? `Diarising… ${Math.round(diarizeProgress)}%`
                     : detailView === "diarize"
                       ? "Transcript"
-                      : "Diarize"}
+                      : "Diarise"}
                 </span>
               </button>
             </div>
@@ -1041,7 +1041,7 @@ export default function MyMeetings() {
                           onClick={() => setShowDiarizeConfirm(true)}
                           className="rounded-lg bg-linear-to-r from-violet-500 to-blue-500 px-5 py-2 text-sm font-bold text-white shadow-sm"
                         >
-                          Diarize now
+                          Diarise now
                         </button>
                       </div>
                     );
@@ -1160,7 +1160,7 @@ export default function MyMeetings() {
         <div className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-900/40 p-4 backdrop-blur-sm">
           <div className="w-full max-w-sm rounded-3xl border border-slate-100 bg-white p-7 shadow-2xl">
             <h3 className="text-xl font-bold text-slate-900">
-              Diarize this meeting?
+              Diarise this meeting?
             </h3>
             {selectedMeeting.audioPath ? (
               <>
@@ -1179,7 +1179,7 @@ export default function MyMeetings() {
                     onClick={() => runReDiarize(selectedMeeting)}
                     className="flex-1 rounded-xl bg-linear-to-r from-violet-500 to-blue-500 py-3 text-sm font-bold text-white shadow-lg shadow-violet-500/25 transition-all hover:from-violet-600 hover:to-blue-600"
                   >
-                    Diarize
+                    Diarise
                   </button>
                 </div>
               </>
@@ -1207,10 +1207,10 @@ export default function MyMeetings() {
         <div className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-900/40 p-4 backdrop-blur-sm">
           <div className="w-full max-w-sm rounded-3xl border border-slate-100 bg-white p-7 shadow-2xl">
             <h3 className="text-xl font-bold text-slate-900">
-              Diarization failed
+              Diarisation failed
             </h3>
             <p className="mt-2 text-sm text-slate-500">
-              {diarizeError ?? "We couldn't diarize this meeting."} You can
+              {diarizeError ?? "We couldn't diarise this meeting."} You can
               retry.
             </p>
             <div className="mt-7 flex gap-3">

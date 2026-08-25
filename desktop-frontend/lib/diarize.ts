@@ -47,7 +47,7 @@ export async function diarizeAudioFile(
       throw new Error(
         result.detail ||
           result.message ||
-          `Diarization failed on part ${i + 1}: ${res.status}`,
+          `Diarisation failed on part ${i + 1}: ${res.status}`,
       );
     }
 

@@ -10,6 +10,7 @@ import {
   Menu,
   FileText,
   Highlighter,
+  ChevronDown,
 } from "lucide-react";
 import { useGlobalRecording } from "@/components/GlobalRecordingProvider";
 import MyMeetings from "@/components/MyMeetings";
@@ -177,6 +178,13 @@ export default function Dashboard() {
   // Per-chunk transcripts from the plain transcribe path, plus the chunk size
   // and the player's resolved length. Together these let us synthesise word
   // timings so the transcript view highlights in sync like the diarize view.
+  const [showDiariseMenu, setShowDiariseMenu] = useState(false);
+  const diariseMenuRef = useRef<HTMLDivElement | null>(null);
+  // Background diarisation is tracked separately from isDiarizing on purpose:
+  // isDiarizing disables recording and upload across the app, which is exactly
+  // what "in background" is meant to avoid.
+  const [bgDiarising, setBgDiarising] = useState(false);
+  const [bgDiariseProgress, setBgDiariseProgress] = useState(0);
   const [transcriptParts, setTranscriptParts] = useState<string[]>([]);
   const [transcriptSegmentSeconds, setTranscriptSegmentSeconds] = useState(300);
   const [resolvedAudioDuration, setResolvedAudioDuration] = useState(0);
@@ -632,7 +640,7 @@ export default function Dashboard() {
       setFinishProgress(100);
       setIsFinishing(false);
       setStatusMessage(
-        "Transcript ready — click Diarize to separate speakers, or Save.",
+        "Transcript ready — click Diarise to separate speakers, or Save.",
       );
     } catch (e: any) {
       if (sid !== sessionIdRef.current) return;
@@ -645,7 +653,15 @@ export default function Dashboard() {
   }, [finishRecording, getRecordingFilePath, stopLiveEvents]);
 
   const handleDiarizeRetry = useCallback(async () => {
-    if (!audioFilePath || isDiarizing || mergedTranscript.length > 0) {
+    // bgDiarising is checked too: the retry modal can still reach this while a
+    // background run is in flight, and two concurrent runs would race to set
+    // mergedTranscript.
+    if (
+      !audioFilePath ||
+      isDiarizing ||
+      bgDiarising ||
+      mergedTranscript.length > 0
+    ) {
       setShowDiarizeRetryModal(false);
       return;
     }
@@ -693,7 +709,7 @@ export default function Dashboard() {
       setDiarizeProgress(0);
       const reason = typeof e?.message === "string" ? e.message.trim() : "";
       setDiarizeError(reason || null);
-      setStatusMessage(`⚠️ ${reason || "Diarization failed"}`);
+      setStatusMessage(`⚠️ ${reason || "Diarisation failed"}`);
       setShowDiarizeRetryModal(true);
     } finally {
       stopSmoothProgress();
@@ -702,12 +718,96 @@ export default function Dashboard() {
   }, [
     audioFilePath,
     isDiarizing,
+    bgDiarising,
     mergedTranscript.length,
     savedMeetingId,
     stopSmoothProgress,
     handleDiarizeProgress,
     saveTranscriptLocally,
   ]);
+
+  /**
+   * Same work as handleDiarizeRetry, but deliberately never sets isDiarizing,
+   * because that flag disables recording and file upload across the app (see
+   * CaptureControls) — locking the UI is precisely what "in background" exists
+   * to avoid. Progress is tracked in its own state for the same reason.
+   *
+   * The result is always written to disk via saveTranscriptLocally, which takes
+   * the rows as an argument and so does not depend on the session still being
+   * current. It is only applied to the on-screen transcript when the user has
+   * not moved on to another recording in the meantime.
+   */
+  const handleDiariseInBackground = useCallback(async () => {
+    if (!audioFilePath || isDiarizing || bgDiarising || mergedTranscript.length > 0) {
+      return;
+    }
+    const sid = sessionIdRef.current;
+    setDiarizeError(null);
+    setBgDiarising(true);
+    setBgDiariseProgress(2);
+    setStatusMessage("Separating speakers in the background — carry on.");
+    try {
+      const rows = (await diarizeAudioFile(audioFilePath, {
+        jwt: localStorage.getItem("token"),
+        onProgress: (done, total) => {
+          const t = total > 0 ? total : 1;
+          setBgDiariseProgress(Math.max(2, (done / t) * 100));
+        },
+      })) as MergedTranscriptRow[];
+
+      setBgDiariseProgress(100);
+      void saveTranscriptLocally(rows);
+
+      if (sid === sessionIdRef.current) {
+        setMergedTranscript(rows);
+        setTranscriptView("diarize");
+        setIsSaved(false);
+        setStatusMessage("Speakers separated — click Save to keep it.");
+      } else {
+        // They started something else while this ran, so dropping the rows into
+        // the live view would overwrite unrelated work. The file on disk keeps
+        // the result either way.
+        setStatusMessage(
+          "Background diarisation finished and was saved to your transcripts folder.",
+        );
+      }
+    } catch (e: any) {
+      const reason = typeof e?.message === "string" ? e.message.trim() : "";
+      setBgDiariseProgress(0);
+      // No retry modal here: a modal would seize the screen the user asked to
+      // keep working on. The Diarise button stays available to try again.
+      setStatusMessage(
+        `⚠️ ${reason || "Background diarisation failed"} — you can try Diarise again.`,
+      );
+    } finally {
+      setBgDiarising(false);
+    }
+  }, [
+    audioFilePath,
+    isDiarizing,
+    bgDiarising,
+    mergedTranscript.length,
+    saveTranscriptLocally,
+  ]);
+
+  // Close the Diarise dropdown on an outside click or Escape.
+  useEffect(() => {
+    if (!showDiariseMenu) return;
+    const onPointerDown = (e: PointerEvent) => {
+      if (!diariseMenuRef.current?.contains(e.target as Node)) {
+        setShowDiariseMenu(false);
+      }
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setShowDiariseMenu(false);
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [showDiariseMenu]);
 
   // File just selected — reset state and wait for the user to click Upload.
   const handleSelectUploadFile = useCallback((file: File) => {
@@ -822,7 +922,7 @@ export default function Dashboard() {
       setActiveTab("live");
       setStatusMessage(
         text.trim()
-          ? "Transcript ready — click Diarize to separate speakers."
+          ? "Transcript ready — click Diarise to separate speakers."
           : "No speech detected in the uploaded file.",
       );
     } catch (e: any) {
@@ -871,7 +971,7 @@ export default function Dashboard() {
   const handleSaveTranscript = useCallback(async () => {
     if (!transcriptText.trim() && mergedTranscript.length === 0) return;
     const sid = sessionIdRef.current;
-    const kind = transcriptView === "diarize" ? "Diarized" : "Transcript";
+    const kind = transcriptView === "diarize" ? "Diarised" : "Transcript";
     const baseName = `ThreadNotes_${kind}_${new Date().toISOString().slice(0, 10)}`;
     const savedText =
       transcriptView === "diarize" && mergedTranscript.length > 0
@@ -1402,13 +1502,72 @@ export default function Dashboard() {
                             Play to highlight the transcript in sync
                           </p>
                           {mergedTranscript.length === 0 ? (
-                            <button
-                              onClick={handleDiarizeRetry}
-                              disabled={isDiarizing || !audioFilePath}
-                              className="shrink-0 rounded-lg bg-linear-to-r from-[#2FB5AA] to-[#2E6DBE] px-4 py-1.5 text-xs font-semibold text-white shadow-sm transition-all hover:from-[#28a29a] hover:to-[#2a61a8] disabled:cursor-not-allowed disabled:opacity-60"
+                            <div
+                              className="relative shrink-0"
+                              ref={diariseMenuRef}
                             >
-                              {isDiarizing ? "Diarizing…" : "Diarize"}
-                            </button>
+                              <button
+                                onClick={() =>
+                                  setShowDiariseMenu((v) => !v)
+                                }
+                                disabled={
+                                  isDiarizing || bgDiarising || !audioFilePath
+                                }
+                                aria-haspopup="menu"
+                                aria-expanded={showDiariseMenu}
+                                className="flex items-center gap-1.5 rounded-lg bg-linear-to-r from-[#2FB5AA] to-[#2E6DBE] px-4 py-1.5 text-xs font-semibold text-white shadow-sm transition-all hover:from-[#28a29a] hover:to-[#2a61a8] disabled:cursor-not-allowed disabled:opacity-60"
+                              >
+                                {isDiarizing
+                                  ? "Diarising…"
+                                  : bgDiarising
+                                    ? `Diarising… ${Math.round(bgDiariseProgress)}%`
+                                    : "Diarise"}
+                                <ChevronDown
+                                  className={`h-3.5 w-3.5 transition-transform ${
+                                    showDiariseMenu ? "rotate-180" : ""
+                                  }`}
+                                />
+                              </button>
+
+                              {showDiariseMenu && (
+                                <div
+                                  role="menu"
+                                  className="absolute right-0 top-full z-30 mt-1.5 w-60 overflow-hidden rounded-xl border border-slate-200 bg-white py-1 shadow-xl"
+                                >
+                                  <button
+                                    role="menuitem"
+                                    onClick={() => {
+                                      setShowDiariseMenu(false);
+                                      void handleDiarizeRetry();
+                                    }}
+                                    className="block w-full px-3 py-2 text-left transition-colors hover:bg-slate-50"
+                                  >
+                                    <span className="block text-xs font-semibold text-slate-700">
+                                      Diarise now
+                                    </span>
+                                    <span className="mt-0.5 block text-[10px] leading-snug text-slate-400">
+                                      Locks recording and upload until it
+                                      finishes
+                                    </span>
+                                  </button>
+                                  <button
+                                    role="menuitem"
+                                    onClick={() => {
+                                      setShowDiariseMenu(false);
+                                      void handleDiariseInBackground();
+                                    }}
+                                    className="block w-full px-3 py-2 text-left transition-colors hover:bg-slate-50"
+                                  >
+                                    <span className="block text-xs font-semibold text-slate-700">
+                                      Diarise in background
+                                    </span>
+                                    <span className="mt-0.5 block text-[10px] leading-snug text-slate-400">
+                                      Keep recording or uploading while it runs
+                                    </span>
+                                  </button>
+                                </div>
+                              )}
+                            </div>
                           ) : transcriptText ? (
                             <button
                               onClick={() =>
@@ -1420,14 +1579,14 @@ export default function Dashboard() {
                             >
                               {/* Label names the view you get by clicking, so it
                                   flips each time: on the transcript it offers
-                                  "Diarize", on the diarized view "Transcript". */}
+                                  "Diarise", on the diarised view "Transcript". */}
                               {transcriptView === "diarize"
                                 ? "Transcript"
-                                : "Diarize"}
+                                : "Diarise"}
                             </button>
                           ) : (
                             <span className="shrink-0 rounded-lg bg-slate-100 px-4 py-1.5 text-xs font-semibold text-slate-500 shadow-sm">
-                              Diarized
+                              Diarised
                             </span>
                           )}
                         </div>
@@ -1793,12 +1952,12 @@ export default function Dashboard() {
         <div className="fixed inset-0 z-100 flex items-center justify-center bg-slate-900/40 p-4 backdrop-blur-sm">
           <div className="w-full max-w-sm rounded-3xl border border-white/60 bg-white p-7 shadow-2xl">
             <h3 className="text-xl font-bold text-slate-900">
-              Diarization failed
+              Diarisation failed
             </h3>
             <p className="mt-2 text-sm text-slate-500">
               {diarizeError ??
                 "We couldn't separate the speakers this time."}{" "}
-              Your transcript is safe — you can retry diarization on the same
+              Your transcript is safe — you can retry diarisation on the same
               recording.
             </p>
             <div className="mt-7 flex gap-3">
