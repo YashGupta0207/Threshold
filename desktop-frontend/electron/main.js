@@ -19,8 +19,8 @@ const { pathToFileURL } = require("url");
 const isDev = !app.isPackaged;
 
 // Force a consistent app-data folder name in BOTH dev and packaged builds. Without
-// this, dev runs use the package.json name ("frontend") → data lands in
-// AppData\Roaming\frontend, which is why it seemed to "disappear". Now everything
+// this, dev runs use the package.json name ("desktop-frontend") → data lands in
+// AppData\Roaming\desktop-frontend, which is why it seemed to "disappear". Now everything
 // always lives under AppData\Roaming\ThreadNotes. Must run before any getPath().
 app.setName("ThreadNotes");
 

@@ -118,6 +118,10 @@ export default function Dashboard() {
   );
   const [audioFilePath, setAudioFilePath] = useState<string | null>(null);
   const [showDiarizeRetryModal, setShowDiarizeRetryModal] = useState(false);
+  // The backend already turns Azure/gateway failures into a plain-English
+  // sentence (quota used up, service busy, credentials rejected). Keep it so
+  // the modal can say what actually went wrong instead of "failed".
+  const [diarizeError, setDiarizeError] = useState<string | null>(null);
   const [savedMeetingId, setSavedMeetingId] = useState<string | null>(null);
   const [highlights, setHighlights] = useState<string[]>([]);
   const [showHighlights, setShowHighlights] = useState(true);
@@ -555,6 +559,7 @@ export default function Dashboard() {
     }
     const sid = sessionIdRef.current;
     setShowDiarizeRetryModal(false);
+    setDiarizeError(null);
 
     if (savedMeetingId) {
       const saved = loadMeetings().find((m) => m.id === savedMeetingId);
@@ -594,7 +599,9 @@ export default function Dashboard() {
       stopSmoothProgress();
       if (sid !== sessionIdRef.current) return;
       setDiarizeProgress(0);
-      setStatusMessage("⚠️ Diarization failed");
+      const reason = typeof e?.message === "string" ? e.message.trim() : "";
+      setDiarizeError(reason || null);
+      setStatusMessage(`⚠️ ${reason || "Diarization failed"}`);
       setShowDiarizeRetryModal(true);
     } finally {
       stopSmoothProgress();
@@ -960,6 +967,7 @@ export default function Dashboard() {
     setHighlightsOnly(false);
     setHlButton(null);
     setShowDiarizeRetryModal(false);
+    setDiarizeError(null);
     setActiveTab("live");
     setView("dashboard");
   }, [cancel, clearPlayback, stopLiveEvents, stopSmoothProgress]);
@@ -1308,9 +1316,12 @@ export default function Dashboard() {
                               }
                               className="shrink-0 rounded-lg bg-linear-to-r from-[#2FB5AA] to-[#2E6DBE] px-4 py-1.5 text-xs font-semibold text-white shadow-sm transition-all hover:from-[#28a29a] hover:to-[#2a61a8]"
                             >
+                              {/* Label names the view you get by clicking, so it
+                                  flips each time: on the transcript it offers
+                                  "Diarize", on the diarized view "Transcript". */}
                               {transcriptView === "diarize"
-                                ? "Diarize"
-                                : "Transcript"}
+                                ? "Transcript"
+                                : "Diarize"}
                             </button>
                           ) : (
                             <span className="shrink-0 rounded-lg bg-slate-100 px-4 py-1.5 text-xs font-semibold text-slate-500 shadow-sm">
@@ -1677,8 +1688,10 @@ export default function Dashboard() {
               Diarization failed
             </h3>
             <p className="mt-2 text-sm text-slate-500">
-              We couldn&apos;t separate the speakers this time. Your transcript
-              is safe — you can retry diarization on the same recording.
+              {diarizeError ??
+                "We couldn't separate the speakers this time."}{" "}
+              Your transcript is safe — you can retry diarization on the same
+              recording.
             </p>
             <div className="mt-7 flex gap-3">
               <button

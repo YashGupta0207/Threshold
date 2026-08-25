@@ -24,15 +24,20 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Provider secrets come from the AI Gateway when DXAI_API_KEY is set, and fall
+# back to .env otherwise. Imported after load_dotenv() so the module sees the
+# gateway config, and before the constants below because it resolves them.
+from gateway_credentials import secret, source_of  # noqa: E402
+
 SECRET_KEY = os.getenv("JWT_SECRET", "threadnotes-super-secret-key")
 ALGORITHM = "HS256"
-AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY", "").strip()
-AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION", "").strip()
+AZURE_SPEECH_KEY = secret("AZURE_SPEECH_KEY").strip()
+AZURE_SPEECH_REGION = secret("AZURE_SPEECH_REGION").strip()
 
-COSMOS_ENDPOINT = os.getenv("COSMOS_ENDPOINT")
-COSMOS_KEY = os.getenv("COSMOS_KEY")
-DATABASE_NAME = os.getenv("COSMOS_DATABASE")
-USERS_CONTAINER = os.getenv("COSMOS_USERS_CONTAINER", "users")
+COSMOS_ENDPOINT = secret("COSMOS_ENDPOINT")
+COSMOS_KEY = secret("COSMOS_KEY")
+DATABASE_NAME = secret("COSMOS_DATABASE")
+USERS_CONTAINER = secret("COSMOS_USERS_CONTAINER", "users")
 
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "").strip()
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
@@ -62,6 +67,7 @@ def _diagnose_env():
     contents — only whether they're set/exist and how large they are."""
     for key in (
         "GMAIL_SENDER",
+        "BREVO_API_KEY",
         "JWT_SECRET",
         "COSMOS_ENDPOINT",
         "COSMOS_KEY",
@@ -69,12 +75,15 @@ def _diagnose_env():
         "AZURE_SPEECH_KEY",
         "AZURE_SPEECH_REGION",
     ):
-        val = os.getenv(key)
+        # secret() rather than os.getenv() so a value supplied by the gateway
+        # doesn't report present=False and send you hunting through .env.
+        val = secret(key)
         _env_log.info(
-            "ENV %-20s present=%-5s length=%s",
+            "ENV %-20s present=%-5s length=%-4s source=%s",
             key,
             bool(val),
             len(val) if val else 0,
+            source_of(key),
         )
 
     for label, path in (
@@ -113,16 +122,56 @@ def get_users_container():
 
 
 def build_openai_client():
+    """Azure OpenAI client — through the gateway proxy, or straight to Azure.
+
+    Proxy mode (GATEWAY_PROXY_AI=true) routes calls via the gateway so they are
+    metered: request counts and token usage show up against the developer token.
+    Direct mode keeps the old behaviour and is the fallback when the token's
+    request quota is exhausted.
+
+    The plain OpenAI client is used for proxy mode rather than AzureOpenAI,
+    because AzureOpenAI rewrites the path to
+    /openai/deployments/{deployment}/... which the gateway does not serve. The
+    plain client posts to {base_url}/audio/transcriptions, which lines up with
+    the gateway's route once base_url ends in /gateway.
+
+    The per-call deployment still travels in the multipart `model` field, which
+    the gateway's Azure adapter reads to pick the deployment — so transcription
+    and diarization can use different deployments over one client.
+    """
     from openai import OpenAI, AzureOpenAI
 
-    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip()
-    key = (os.getenv("AZURE_OPENAI_KEY") or os.getenv("OPENAI_API_KEY") or "").strip()
+    if os.getenv("GATEWAY_PROXY_AI", "").strip().lower() in ("1", "true", "yes"):
+        gw_token = os.getenv("DXAI_API_KEY", "").strip()
+        gw_base = (os.getenv("DXAI_BASE_URL") or "").strip().rstrip("/")
+        if not gw_token or not gw_base:
+            raise HTTPException(
+                status_code=500,
+                detail="GATEWAY_PROXY_AI is on but DXAI_API_KEY/DXAI_BASE_URL are unset.",
+            )
+        return OpenAI(
+            api_key=gw_token,
+            base_url=f"{gw_base}/gateway",
+            default_headers={
+                "X-Gateway-Provider": os.getenv("GATEWAY_AI_PROVIDER", "AzureOpenAI"),
+                # gpt-4o-transcribe is not served on the gateway's 2024-06-01
+                # default, so pin the version this deployment needs.
+                "X-Gateway-Api-Version": secret(
+                    "AZURE_OPENAI_API_VERSION", "2025-04-01-preview"
+                ).strip(),
+            },
+            timeout=1500,
+            max_retries=0,
+        )
+
+    endpoint = secret("AZURE_OPENAI_ENDPOINT").strip()
+    key = (secret("AZURE_OPENAI_KEY") or secret("OPENAI_API_KEY")).strip()
     if not key:
         raise HTTPException(status_code=500, detail="OpenAI/Azure OpenAI key is missing in the vault.")
     if endpoint:
         return AzureOpenAI(
             api_key=key,
-            api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2025-04-01-preview").strip(),
+            api_version=secret("AZURE_OPENAI_API_VERSION", "2025-04-01-preview").strip(),
             azure_endpoint=endpoint,
             timeout=1500,
             max_retries=0,
@@ -205,6 +254,15 @@ GMAIL_TOKEN_PATH = os.getenv(
 )
 _gmail_service = None
 
+BREVO_API_KEY = os.getenv("BREVO_API_KEY", "").strip()
+BREVO_API_URL = "https://api.brevo.com/v3/smtp/email"
+BREVO_SENDER_NAME = os.getenv("BREVO_SENDER_NAME", "ThreadNotes").strip()
+# Brevo only accepts a From address verified in its dashboard, which need not be
+# the Gmail API sender. Falls back to GMAIL_SENDER when they are the same address.
+BREVO_SENDER_EMAIL = os.getenv(
+    "BREVO_SENDER_EMAIL", os.getenv("GMAIL_SENDER", "")
+).strip()
+
 
 def _build_gmail_service():
     """Build an authenticated Gmail API client from on-disk OAuth secret files.
@@ -266,7 +324,53 @@ def _get_gmail_service():
     return _gmail_service
 
 
+def _send_otp_via_brevo(target_email: str, otp: str, subject_prefix: str):
+    """Send the OTP through Brevo's transactional API.
+
+    The sender address must be verified in the Brevo dashboard (Senders,
+    Domains & Dedicated IPs) or the API rejects the send with a 400.
+    """
+    if not BREVO_SENDER_EMAIL:
+        raise HTTPException(
+            status_code=500,
+            detail="BREVO_SENDER_EMAIL must be set to a Brevo-verified sender address.",
+        )
+
+    payload = {
+        "sender": {"name": BREVO_SENDER_NAME, "email": BREVO_SENDER_EMAIL},
+        "to": [{"email": target_email}],
+        "subject": f"ThreadNotes - {subject_prefix} OTP",
+        "textContent": (
+            f"Your OTP for {subject_prefix} is: {otp}\n\n"
+            "Please do not share this with anyone."
+        ),
+    }
+
+    try:
+        resp = httpx.post(
+            BREVO_API_URL,
+            json=payload,
+            headers={"api-key": BREVO_API_KEY, "accept": "application/json"},
+            timeout=15.0,
+        )
+    except httpx.RequestError as e:
+        print(f"CRITICAL BREVO ERROR: {repr(e)}")
+        raise HTTPException(status_code=502, detail=f"Could not reach Brevo: {e}")
+
+    if resp.status_code >= 400:
+        print(f"CRITICAL BREVO ERROR: HTTP {resp.status_code} — {resp.text}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Brevo rejected the send (HTTP {resp.status_code}): {resp.text}",
+        )
+
+    print(f"[BREVO] OTP email sent to {target_email} — {resp.json()}")
+
+
 def send_otp_email(target_email: str, otp: str, subject_prefix: str):
+    if BREVO_API_KEY:
+        return _send_otp_via_brevo(target_email, otp, subject_prefix)
+
     try:
         service = _get_gmail_service()
 
@@ -482,7 +586,7 @@ def _delete_user_transcripts(user_id: str) -> int:
         client = CosmosClient(COSMOS_ENDPOINT, COSMOS_KEY)
         database = client.get_database_client(DATABASE_NAME)
         container = database.get_container_client(
-            os.getenv("COSMOS_TRANSCRIPTS_CONTAINER", "transcripts")
+            secret("COSMOS_TRANSCRIPTS_CONTAINER", "transcripts")
         )
         items = list(
             container.query_items(
@@ -736,6 +840,31 @@ def _friendly_diarize_error(exc: Exception) -> str:
             "We couldn't reach the transcription service. "
             "Please check your internet connection and try again."
         )
+    # A 429 means two very different things, and the fixes are opposite: a
+    # provider rate limit clears on its own in a minute, an exhausted gateway
+    # quota never does without an admin raising the cap. "limit exceeded" is
+    # the gateway's own wording (_enforce_limits) and only appears for quota,
+    # so check it before the generic rate-limit branch below.
+    # Matched on the gateway's four exact phrases rather than a loose
+    # "limit exceeded", because Azure also says things like "rate limit
+    # exceeded" — which is the opposite situation and must not land here.
+    if any(
+        f"{period} {unit} limit exceeded" in msg
+        for period in ("daily", "monthly")
+        for unit in ("request", "token")
+    ):
+        unit = "token" if "token limit exceeded" in msg else "request"
+        if "daily" in msg:
+            period, resets = "daily", " It resets tomorrow."
+        elif "monthly" in msg:
+            period, resets = "monthly", " It resets at the start of next month."
+        else:
+            period, resets = "", ""
+        quota = f"{period} {unit}".strip()
+        return (
+            f"You have reached the limit — your {quota} quota has been used up."
+            f"{resets} Please contact your administrator to increase it."
+        )
     if status == 429 or "rate limit" in msg or "ratelimit" in name:
         return (
             "The transcription service is busy right now. "
@@ -862,7 +991,7 @@ def _renumber_speakers(segments: List[dict]) -> List[dict]:
 
 def _run_diarization(audio_bytes: bytes, filename: str, content_type: str = "") -> list:
     client = build_openai_client()
-    deployment = os.getenv("AZURE_DIARIZE_DEPLOYMENT", "gpt-4o-transcribe-diarize").strip()
+    deployment = secret("AZURE_DIARIZE_DEPLOYMENT", "gpt-4o-transcribe-diarize").strip()
 
     safe_name = filename or "audio.ogg"
     mime = content_type or "audio/ogg"
@@ -921,6 +1050,27 @@ def _run_diarization(audio_bytes: bytes, filename: str, content_type: str = "") 
             }
         )
 
+    # A recording with one speaker (or one with speech the model won't split)
+    # comes back as text with an empty `segments` list. Returning [] there gives
+    # the user an empty diarized view next to a perfectly good transcript, which
+    # reads as a failure. Emit the whole chunk as Speaker 1 instead — the audio
+    # really does have exactly one speaker.
+    if not segments:
+        whole = (data.get("text") or "").strip()
+        if whole and not _is_noise_fragment(whole):
+            duration = float(data.get("duration", 0.0) or 0.0)
+            segments = [
+                {
+                    "type": "transcript",
+                    "text": whole,
+                    "speaker": "Speaker 1",
+                    "start": 0.0,
+                    "end": round(duration, 3),
+                    "words": interpolate_words(whole, 0.0, duration),
+                }
+            ]
+        return segments
+
     segments = _merge_ghost_speakers(segments)
     segments = _renumber_speakers(segments)
     return segments
@@ -957,16 +1107,20 @@ async def diarize_stream(
 def _run_transcription(audio_bytes: bytes, filename: str, content_type: str = "") -> str:
     client = build_openai_client()
     deployment = (
-        os.getenv("AZURE_TRANSCRIBE_DEPLOYMENT")
-        or os.getenv("AZURE_WHISPER_DEPLOYMENT")
+        secret("AZURE_TRANSCRIBE_DEPLOYMENT")
+        or secret("AZURE_WHISPER_DEPLOYMENT")
         or "gpt-4o-transcribe"
     ).strip()
     safe_name = filename or "audio.ogg"
     mime = content_type or "audio/ogg"
+    # "json" rather than "text": Azure only returns a `usage` block on the JSON
+    # response, and without it the gateway has no token counts to record. The
+    # transcript itself is identical — it just arrives as .text instead of a
+    # bare string, which the return below already handles either way.
     resp = client.audio.transcriptions.create(
         model=deployment,
         file=(safe_name, audio_bytes, mime),
-        response_format="text",
+        response_format="json",
     )
     if isinstance(resp, str):
         return resp.strip()

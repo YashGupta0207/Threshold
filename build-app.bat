@@ -6,16 +6,16 @@ REM Node/Electron: it records, compresses via the bundled ffmpeg, and talks only
 REM to the Cloud Vault. No PyInstaller step is required.
 
 echo Verifying bundled ffmpeg.exe is present...
-if not exist "%~dp0frontend\resources\ffmpeg.exe" (
-  echo ERROR: frontend\resources\ffmpeg.exe is missing.
-  echo Download a static Windows ffmpeg build and place ffmpeg.exe at frontend\resources\ffmpeg.exe
+if not exist "%~dp0desktop-frontend\resources\ffmpeg.exe" (
+  echo ERROR: desktop-frontend\resources\ffmpeg.exe is missing.
+  echo Download a static Windows ffmpeg build and place ffmpeg.exe at desktop-frontend\resources\ffmpeg.exe
   pause
   exit /b 1
 )
 
 echo.
 echo Building Electron app with electron-builder...
-cd /d "%~dp0frontend"
+cd /d "%~dp0desktop-frontend"
 npm install
 npm run dist:win
 
@@ -26,5 +26,5 @@ if errorlevel 1 (
 )
 
 echo.
-echo Build complete. Check frontend\dist-electron for the installer.
+echo Build complete. Check desktop-frontend\dist-electron for the installer.
 pause

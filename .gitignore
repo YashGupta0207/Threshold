@@ -1,9 +1,46 @@
-# Gmail API OAuth secrets — NEVER commit these
+# ─────────────────────────────────────────────────────────────────────────────
+# Secrets — NEVER commit these
+# ─────────────────────────────────────────────────────────────────────────────
 credentials.json
 token.json
-backend/credentials.json
-backend/token.json
+desktop-backend/credentials.json
+desktop-backend/token.json
 
-# Environment / secrets
 .env
 .env.*
+
+# Exception: the desktop client's env files hold only NEXT_PUBLIC_API_URL, which
+# is a public build-time constant baked into the shipped .exe (see DEPLOY.md §4).
+# They are not secrets, and `next build` needs them, so they stay tracked.
+!desktop-frontend/.env
+!desktop-frontend/.env.development
+!desktop-frontend/.env.production
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Python
+# ─────────────────────────────────────────────────────────────────────────────
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Built SDK artifacts — the gateway SDK is installed from source (`pip install -e .`)
+gateway-sdk/dist/
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Node / Next.js / Electron
+# ─────────────────────────────────────────────────────────────────────────────
+node_modules/
+.next/
+out/
+dist-electron/
+*.tsbuildinfo
+desktop-frontend/electron/build-info.json
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OS / editor junk
+# ─────────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.log

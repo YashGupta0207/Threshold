@@ -1,7 +1,7 @@
 # ThreadNotes — Deployment Guide
 
-A **SaaS split**: the FastAPI backend (this repo's `backend/`) is deployed once to
-Render as a Docker service; the Electron desktop client (`frontend/`) is built into
+A **SaaS split**: the FastAPI backend (this repo's `desktop-backend/`) is deployed once to
+Render as a Docker service; the Electron desktop client (`desktop-frontend/`) is built into
 an installer that ships to users and talks to that cloud backend. **No API keys ever
 ship in the client.**
 
@@ -10,7 +10,7 @@ ship in the client.**
 ## 1. Backend → Render (Docker)
 
 The backend deploys from [`render.yaml`](render.yaml) using
-[`backend/Dockerfile`](backend/Dockerfile) (Python 3.11-slim + `ffmpeg`).
+[`desktop-backend/Dockerfile`](desktop-backend/Dockerfile) (Python 3.11-slim + `ffmpeg`).
 
 ### 1a. First deploy
 1. Push this repo to GitHub/GitLab.
@@ -47,7 +47,7 @@ Already defaulted in `render.yaml` (override only if needed): `JWT_SECRET`
 ### 3a. Email delivery — Resend (HTTP API, not SMTP)
 Render's free tier **blocks outbound SMTP (port 587)** — `smtplib` fails with
 `[Errno 101] Network is unreachable`. So OTP / password-reset emails are sent via
-the **Resend HTTP API** over HTTPS (`send_otp_email` in `backend/main.py`, using the
+the **Resend HTTP API** over HTTPS (`send_otp_email` in `desktop-backend/vault/main.py`, using the
 already-installed `httpx` — no extra dependency).
 
 Two env vars (both `sync: false` in `render.yaml`):
@@ -71,8 +71,8 @@ used** — remove them from Render if present. Watch the logs for
 
 ### 1c. Local image test (optional, needs Docker)
 ```bash
-docker build -t threadnotes-backend ./backend
-docker run -p 8000:8000 --env-file backend/.env threadnotes-backend
+docker build -t threadnotes-backend ./desktop-backend
+docker run -p 8000:8000 --env-file desktop-backend/.env threadnotes-backend
 # open http://localhost:8000/docs
 ```
 
@@ -100,7 +100,7 @@ usual cause.
 The **packaged Electron renderer's `Origin` is `app://local`** (not `localhost`), and
 the dev renderer is `http://localhost:3000`. The backend must allow both.
 
-Current `backend/main.py` uses `allow_origins=["*"]`, which works for the
+Current `desktop-backend/vault/main.py` uses `allow_origins=["*"]`, which works for the
 **non-credentialed** requests the app makes today (Bearer header in JS, no cookies).
 When you're ready to tighten it, pin explicitly:
 
@@ -127,18 +127,18 @@ backend URL is frozen into the `.exe` when you build it. Changing it later means
 **rebuilding and redistributing** the installer.
 
 ### Steps to ship a client pointed at production
-1. Edit [`frontend/.env.production`](frontend/.env.production):
+1. Edit [`desktop-frontend/.env.production`](desktop-frontend/.env.production):
    ```
    NEXT_PUBLIC_API_URL=https://threadnotes-backend.onrender.com
    ```
    (your real Render URL, HTTPS, no trailing slash).
 2. Build the installer:
    ```bash
-   cd frontend
+   cd desktop-frontend
    npm run dist:win
    ```
    `dist:win` runs `next build` (which applies `.env.production`, overriding `.env`)
-   then `electron-builder`. Output: `frontend/dist-electron/ThreadNotes Setup x.x.x.exe`.
+   then `electron-builder`. Output: `desktop-frontend/dist-electron/ThreadNotes Setup x.x.x.exe`.
 3. Distribute that `.exe`.
 
 | Build | Env file used | API target |

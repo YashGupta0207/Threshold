@@ -106,6 +106,9 @@ export default function MyMeetings() {
   const [diarizing, setDiarizing] = useState(false);
   const [diarizeProgress, setDiarizeProgress] = useState(0);
   const [showDiarizeRetry, setShowDiarizeRetry] = useState(false);
+  // Keep the backend's plain-English reason (quota used up, service busy,
+  // credentials rejected) so the modal can name the actual problem.
+  const [diarizeError, setDiarizeError] = useState<string | null>(null);
 
   const [mtgHighlights, setMtgHighlights] = useState<string[]>([]);
   const [mtgShowHighlights, setMtgShowHighlights] = useState(true);
@@ -399,6 +402,7 @@ export default function MyMeetings() {
     setDetailView(getDiarizedRows(meeting) ? "diarize" : "transcript");
     setShowDiarizeConfirm(false);
     setShowDiarizeRetry(false);
+    setDiarizeError(null);
     setDiarizing(false);
     setDiarizeProgress(0);
     setMtgHighlights(meeting.highlights ?? []);
@@ -464,6 +468,7 @@ export default function MyMeetings() {
     }
     setShowDiarizeConfirm(false);
     setShowDiarizeRetry(false);
+    setDiarizeError(null);
     setDiarizing(true);
     setDiarizeProgress(2);
     let creep: ReturnType<typeof setInterval> | null = null;
@@ -511,10 +516,12 @@ export default function MyMeetings() {
       setDiarizing(false);
       setDetailView("diarize");
       showToast("Diarization complete");
-    } catch {
+    } catch (e: any) {
       stopCreep();
       setDiarizing(false);
       setDiarizeProgress(0);
+      const reason = typeof e?.message === "string" ? e.message.trim() : "";
+      setDiarizeError(reason || null);
       setShowDiarizeRetry(true);
     }
   };
@@ -939,11 +946,14 @@ export default function MyMeetings() {
                   />
                 )}
                 <span className="relative">
+                  {/* Label names the view you get by clicking, so it flips each
+                      time. On the transcript it reads "Diarize" whether the
+                      speakers are already separated or still have to be. */}
                   {diarizing
                     ? `Diarizing… ${Math.round(diarizeProgress)}%`
                     : detailView === "diarize"
-                      ? "Diarize"
-                      : "Transcript"}
+                      ? "Transcript"
+                      : "Diarize"}
                 </span>
               </button>
             </div>
@@ -1200,7 +1210,8 @@ export default function MyMeetings() {
               Diarization failed
             </h3>
             <p className="mt-2 text-sm text-slate-500">
-              We couldn&apos;t diarize this meeting. You can retry.
+              {diarizeError ?? "We couldn't diarize this meeting."} You can
+              retry.
             </p>
             <div className="mt-7 flex gap-3">
               <button
