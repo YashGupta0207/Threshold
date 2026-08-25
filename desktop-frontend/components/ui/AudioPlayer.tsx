@@ -27,11 +27,19 @@ export default function AudioPlayer({
   src,
   audioRef,
   onTimeUpdate,
+  onDuration,
   durationSec,
 }: {
   src: string;
   audioRef?: RefObject<HTMLAudioElement | null>;
   onTimeUpdate?: (t: number) => void;
+  /**
+   * Fires once the real playable length is known. This player already resolves
+   * the WebM "duration is Infinity" case by scanning to the end, so it is the
+   * only place that knows the true length; callers that need it (karaoke word
+   * timing) would otherwise have to duplicate that scan.
+   */
+  onDuration?: (seconds: number) => void;
   durationSec?: number;
 }) {
   const localRef = useRef<HTMLAudioElement | null>(null);
@@ -98,6 +106,10 @@ export default function AudioPlayer({
   const elDur = Number.isFinite(duration) && duration > 0 ? duration : 0;
   const knownDur = durationSec && durationSec > 0 ? durationSec : 0;
   const effectiveDuration = Math.max(elDur, knownDur);
+
+  useEffect(() => {
+    if (effectiveDuration > 0) onDuration?.(effectiveDuration);
+  }, [effectiveDuration, onDuration]);
 
   const skip = (delta: number) => {
     const el = ref.current;

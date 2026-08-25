@@ -37,6 +37,46 @@ type TranscriptWord = {
   end: number;
 };
 
+/**
+ * Spread words evenly across a time span, weighted by word length and by the
+ * pause that punctuation implies. This is a port of interpolate_words() in
+ * desktop-backend/vault/main.py, which the diarize path already falls back to
+ * whenever the model returns segments without per-word timings. Keeping the
+ * same weighting means both views highlight at the same cadence.
+ *
+ * These timings are estimated, not measured: gpt-4o-transcribe only supports
+ * the "json" and "text" response formats, so it cannot return real word
+ * timestamps (that needs verbose_json + timestamp_granularities, a whisper-1
+ * feature). Highlighting tracks well through continuous speech and drifts
+ * across long silences.
+ */
+function interpolateWords(
+  text: string,
+  start: number,
+  end: number,
+): TranscriptWord[] {
+  const words = text.split(/\s+/).filter(Boolean);
+  if (words.length === 0) return [];
+  const weights = words.map(
+    (w) => w.length + 1 + (/[.?!,;-]$/.test(w) ? 5 : 0),
+  );
+  const total = weights.reduce((a, b) => a + b, 0) || 1;
+  const duration = Math.max(0, end - start);
+  const out: TranscriptWord[] = [];
+  let cursor = start;
+  words.forEach((w, i) => {
+    const cursorEnd = cursor + duration * (weights[i] / total);
+    out.push({
+      word: w,
+      start: Number(cursor.toFixed(3)),
+      end: Number(Math.min(end, cursorEnd).toFixed(3)),
+    });
+    cursor = cursorEnd;
+  });
+  out[out.length - 1].end = Number(end.toFixed(3));
+  return out;
+}
+
 type MergedTranscriptRow = {
   speaker: string;
   text: string;
@@ -134,6 +174,12 @@ export default function Dashboard() {
     text: string;
   } | null>(null);
   const [currentAudioTime, setCurrentAudioTime] = useState(0);
+  // Per-chunk transcripts from the plain transcribe path, plus the chunk size
+  // and the player's resolved length. Together these let us synthesise word
+  // timings so the transcript view highlights in sync like the diarize view.
+  const [transcriptParts, setTranscriptParts] = useState<string[]>([]);
+  const [transcriptSegmentSeconds, setTranscriptSegmentSeconds] = useState(300);
+  const [resolvedAudioDuration, setResolvedAudioDuration] = useState(0);
   const [mergedEditMode, setMergedEditMode] = useState(false);
   const [mergedDraft, setMergedDraft] = useState("");
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -268,6 +314,45 @@ export default function Dashboard() {
     statusMessage ??
     (isPaused ? "Paused" : isRecording ? "Listening..." : "Ready");
 
+  /**
+   * Word timings for the undiarized transcript view. The diarize path gets real
+   * per-word spans from the model, but /transcribe/stream returns text only, so
+   * without this the view renders one flat block and nothing can highlight.
+   *
+   * Anchored per chunk where possible: chunk i covers
+   * [i * segmentSeconds, (i+1) * segmentSeconds] clamped to the real length, so
+   * the estimate re-syncs to the audio every chunk instead of accumulating
+   * drift across the whole file. Live recordings have no chunks, so they fall
+   * back to spreading the transcript across the full duration.
+   */
+  const transcriptWords = useMemo<TranscriptWord[]>(() => {
+    if (mergedTranscript.length > 0) return [];
+    const duration = resolvedAudioDuration;
+    if (!duration || duration <= 0) return [];
+
+    if (transcriptParts.some((p) => p.trim()) && transcriptSegmentSeconds > 0) {
+      const out: TranscriptWord[] = [];
+      transcriptParts.forEach((part, i) => {
+        if (!part.trim()) return;
+        const start = Math.min(i * transcriptSegmentSeconds, duration);
+        const end = Math.min((i + 1) * transcriptSegmentSeconds, duration);
+        if (end <= start) return;
+        out.push(...interpolateWords(part, start, end));
+      });
+      if (out.length > 0) return out;
+    }
+
+    return transcriptText.trim()
+      ? interpolateWords(transcriptText, 0, duration)
+      : [];
+  }, [
+    mergedTranscript.length,
+    transcriptParts,
+    transcriptSegmentSeconds,
+    transcriptText,
+    resolvedAudioDuration,
+  ]);
+
   const activeWordStart = useMemo(() => {
     for (const seg of mergedTranscript) {
       const ws = seg.words;
@@ -278,8 +363,13 @@ export default function Dashboard() {
         }
       }
     }
+    for (const w of transcriptWords) {
+      if (currentAudioTime >= w.start && currentAudioTime < w.end) {
+        return w.start;
+      }
+    }
     return null;
-  }, [mergedTranscript, currentAudioTime]);
+  }, [mergedTranscript, transcriptWords, currentAudioTime]);
 
   useEffect(() => {
     if (activeWordStart == null) return;
@@ -444,6 +534,8 @@ export default function Dashboard() {
     setLines([]);
     setInterim("");
     setMergedTranscript([]);
+    setTranscriptParts([]);
+    setResolvedAudioDuration(0);
     setSessionTime(0);
     setIsSaved(false);
     setAudioFilePath(null);
@@ -638,6 +730,8 @@ export default function Dashboard() {
     setLines([]);
     setInterim("");
     setMergedTranscript([]);
+    setTranscriptParts([]);
+    setResolvedAudioDuration(0);
     setIsSaved(false);
     setIsUploading(false);
     setUploadProgress(0);
@@ -707,17 +801,22 @@ export default function Dashboard() {
     setTranscriptView("transcript");
     setStatusMessage("Transcribing…");
     try {
-      const text = await transcribeAudioFile(localPath, {
-        jwt: token,
-        onProgress: (doneN, total) => {
-          if (total > 0 && sid === sessionIdRef.current) {
-            setUploadProgress(Math.round((doneN / total) * 100));
-          }
+      const { text, parts, segmentSeconds } = await transcribeAudioFile(
+        localPath,
+        {
+          jwt: token,
+          onProgress: (doneN, total) => {
+            if (total > 0 && sid === sessionIdRef.current) {
+              setUploadProgress(Math.round((doneN / total) * 100));
+            }
+          },
         },
-      });
+      );
       if (sid !== sessionIdRef.current) return;
       setAudioUrl(uploadedMediaUrl || URL.createObjectURL(uploadFile));
       setLines(text.trim() ? [text.trim()] : []);
+      setTranscriptParts(parts);
+      setTranscriptSegmentSeconds(segmentSeconds);
       setMergedTranscript([]);
       setTranscriptView("transcript");
       setActiveTab("live");
@@ -957,6 +1056,8 @@ export default function Dashboard() {
     setLines([]);
     setInterim("");
     setMergedTranscript([]);
+    setTranscriptParts([]);
+    setResolvedAudioDuration(0);
     setUploadFile(null);
     setStatusMessage(null);
     setIsSaved(false);
@@ -1293,6 +1394,7 @@ export default function Dashboard() {
                           src={audioUrl}
                           audioRef={audioRef}
                           onTimeUpdate={setCurrentAudioTime}
+                          onDuration={setResolvedAudioDuration}
                           durationSec={playbackDurationSec}
                         />
                         <div className="mt-2 flex items-center justify-between gap-3">
@@ -1347,9 +1449,15 @@ export default function Dashboard() {
                           {(() => {
                             // Karaoke in transcript view too: if diarized words
                             // exist, flatten them and highlight the spoken word.
-                            const allWords = mergedTranscript.flatMap(
+                            const diarizedWords = mergedTranscript.flatMap(
                               (r) => r.words ?? [],
                             );
+                            // Fall back to the interpolated timings so the
+                            // plain transcript highlights too, not just the
+                            // diarized view.
+                            const allWords = diarizedWords.length
+                              ? diarizedWords
+                              : transcriptWords;
                             if (allWords.length > 0) {
                               const rowText = allWords
                                 .map((w) => w.word)

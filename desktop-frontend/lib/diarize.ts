@@ -78,10 +78,23 @@ export async function diarizeAudioFile(
   return stitched;
 }
 
+export type TranscribeResult = {
+  /** The stitched transcript, exactly what the UI shows. */
+  text: string;
+  /**
+   * Per-chunk transcripts kept at their original index (empty chunks included,
+   * so index i always maps to the audio span starting at i * segmentSeconds).
+   * Callers use this to anchor interpolated word timings to real chunk bounds
+   * rather than spreading them across the whole file, which drifts badly.
+   */
+  parts: string[];
+  segmentSeconds: number;
+};
+
 export async function transcribeAudioFile(
   audioFilePath: string,
   opts: Opts = {},
-): Promise<string> {
+): Promise<TranscribeResult> {
   const electron =
     typeof window !== "undefined" ? window.electronAPI : undefined;
   if (!electron?.audioCompressAndRead) {
@@ -90,10 +103,8 @@ export async function transcribeAudioFile(
 
   // gpt-4o-transcribe has a small audio-token limit, so transcription uses much
   // shorter chunks (5 min) than diarization (which keeps the large default).
-  const { chunks, mimeType } = await electron.audioCompressAndRead(
-    audioFilePath,
-    300,
-  );
+  const { chunks, segmentSeconds, mimeType } =
+    await electron.audioCompressAndRead(audioFilePath, 300);
 
   const total = chunks.length;
   const parts: string[] = new Array(total).fill("");
@@ -136,5 +147,9 @@ export async function transcribeAudioFile(
 
   await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
 
-  return parts.filter(Boolean).join("\n\n");
+  return {
+    text: parts.filter(Boolean).join("\n\n"),
+    parts,
+    segmentSeconds: segmentSeconds || 300,
+  };
 }
