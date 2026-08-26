@@ -1202,6 +1202,78 @@ GEMINI_API_URL = (
 )
 
 
+def _summary_via_gateway(model: str, text: str) -> str | None:
+    """Run the completion through the gateway so it can be metered.
+
+    The gateway only writes an ApiRequestLog row on its proxy paths;
+    /gateway/credentials just hands over keys and counts nothing. So a summary
+    called straight at Google is invisible to the admin dashboard no matter how
+    many are run. Going through /gateway/chat/completions is what makes
+    requests, prompt/completion tokens and last-used appear.
+
+    Returns None when the gateway itself is unreachable or broken, so the
+    caller can still produce a summary directly. A 4xx is a real answer -- bad
+    token, provider not authorised -- and is raised rather than silently
+    bypassed, because falling back there would hide a misconfiguration forever.
+    """
+    token = os.getenv("DXAI_API_KEY", "").strip()
+    base = (os.getenv("DXAI_BASE_URL") or "").strip().rstrip("/")
+    if not token or not base:
+        return None
+
+    try:
+        resp = httpx.post(
+            f"{base}/gateway/chat/completions",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "X-Gateway-Provider": os.getenv("GATEWAY_SUMMARY_PROVIDER", "gemini"),
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                # The gemini adapter maps this OpenAI shape onto
+                # models/{model}:generateContent, folding "system" into the
+                # first user turn since Gemini has no system role in contents.
+                "messages": [
+                    {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
+                    {"role": "user", "content": text},
+                ],
+            },
+            timeout=180.0,
+        )
+    except httpx.RequestError as exc:
+        print(f"GATEWAY summary proxy unreachable, calling Gemini directly: {exc!r}")
+        return None
+
+    if resp.status_code >= 500:
+        print(
+            "GATEWAY summary proxy HTTP %s, calling Gemini directly: %s"
+            % (resp.status_code, resp.text[:200])
+        )
+        return None
+    if resp.status_code >= 400:
+        print(f"GATEWAY summary proxy rejected: {resp.status_code} {resp.text[:300]}")
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"The AI gateway rejected the summary request "
+                f"(HTTP {resp.status_code}). Check the token is authorised for "
+                "the gemini provider."
+            ),
+        )
+
+    try:
+        data = resp.json()
+    except ValueError:
+        return None
+
+    choices = data.get("choices") or []
+    if not choices:
+        return None
+    content = ((choices[0].get("message") or {}).get("content") or "").strip()
+    return content or None
+
+
 def _run_summary(transcript: str) -> str:
     """Summarise a transcript with Gemini.
 
@@ -1230,6 +1302,13 @@ def _run_summary(transcript: str) -> str:
             + "\n\n[... middle of the transcript omitted for length ...]\n\n"
             + text[-half:]
         )
+
+    # Same switch that routes audio through the gateway, so metering is on or
+    # off for the whole vault rather than per feature.
+    if os.getenv("GATEWAY_PROXY_AI", "").strip().lower() in ("1", "true", "yes"):
+        proxied = _summary_via_gateway(model, text)
+        if proxied:
+            return proxied
 
     payload = {
         "systemInstruction": {"parts": [{"text": SUMMARY_SYSTEM_PROMPT}]},
