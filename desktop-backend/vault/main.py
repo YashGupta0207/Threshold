@@ -1255,13 +1255,20 @@ def _summary_via_gateway(model: str, text: str) -> str | None:
         print(f"GATEWAY summary proxy unreachable, calling Gemini directly: {exc!r}")
         return None
 
-    # 429 is a quota rejection, not a misconfiguration. Treat it like a gateway
-    # fault and fall back, so an exhausted cap cannot take summaries down --
-    # matching what _proxy_or_direct() does for audio.
-    if resp.status_code >= 500 or resp.status_code == 429:
+    # A spent quota is fatal here too, for the same reason as audio: falling
+    # back would mean the limit never actually limits anything.
+    if resp.status_code == 429:
+        print("GATEWAY summary quota reached: %s" % resp.text[:200])
+        raise HTTPException(
+            status_code=429,
+            detail=_friendly_diarize_error(
+                RuntimeError(resp.text or "daily token limit exceeded")
+            ),
+        )
+    if resp.status_code >= 500:
         print(
-            "GATEWAY summary proxy unusable (HTTP %s), calling Gemini directly "
-            "— this call will NOT be metered: %s"
+            "GATEWAY summary proxy unreachable (HTTP %s), calling Gemini "
+            "directly — this call will NOT be metered: %s"
             % (resp.status_code, resp.text[:200])
         )
         return None
@@ -1314,15 +1321,24 @@ def _proxy_or_direct(call):
             getattr(exc, "response", None), "status_code", None
         )
         body = str(getattr(exc, "message", "") or exc)
-        quota_hit = status == 429 or "limit exceeded" in body.lower()
-        gateway_down = status is not None and status >= 500
-        if not (quota_hit or gateway_down):
+
+        # A spent quota is deliberately fatal. Falling back would keep the app
+        # working while silently spending unmetered, which defeats having a
+        # limit at all -- the caller turns this into the plain-English
+        # "you have reached the limit" message via _friendly_diarize_error.
+        if status == 429 or "limit exceeded" in body.lower():
+            print("GATEWAY quota reached, refusing the call: %s" % body[:200])
             raise
-        print(
-            "GATEWAY proxy unusable for this call (%s), retrying direct — "
-            "this call will NOT be metered: %s" % (status, body[:200])
-        )
-        return call(build_openai_client(force_direct=True))
+
+        # A gateway outage is a different matter: it is not the user exceeding
+        # anything, so the work still goes through, unmetered and logged.
+        if status is not None and status >= 500:
+            print(
+                "GATEWAY unreachable (%s), retrying direct — this call will "
+                "NOT be metered: %s" % (status, body[:200])
+            )
+            return call(build_openai_client(force_direct=True))
+        raise
 
 
 def _run_summary(transcript: str) -> str:
