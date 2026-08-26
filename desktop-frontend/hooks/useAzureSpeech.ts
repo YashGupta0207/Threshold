@@ -108,6 +108,23 @@ export function useAzureSpeech(initialProps?: UseAzureSpeechProps) {
 
   const initRecognizer = useCallback(
     (token: string, region: string): SpeechSDK.SpeechRecognizer => {
+      // An orphaned recognizer keeps firing `recognized` through
+      // callbacksRef, and once this ref is overwritten nothing can ever
+      // stop it -- so dispose whatever is here before replacing it.
+      const stale = recognizerRef.current;
+      if (stale) {
+        recognizerRef.current = null;
+        try {
+          stale.stopContinuousRecognitionAsync(
+            () => stale.close(),
+            () => stale.close(),
+          );
+        } catch {
+          try {
+            stale.close();
+          } catch {}
+        }
+      }
       const speechConfig = SpeechSDK.SpeechConfig.fromAuthorizationToken(
         token,
         region,
@@ -199,6 +216,12 @@ export function useAzureSpeech(initialProps?: UseAzureSpeechProps) {
     [],
   );
 
+  // Guards start() against running twice. A second run used to reset
+  // recordedChunksRef (dropping the first recorder's header chunk, which
+  // left an undecodable .webm) and attach a second recognizer, which
+  // reported every sentence twice.
+  const startingRef = useRef(false);
+
   const reconnect = useCallback(async (): Promise<boolean> => {
     if (reconnectingRef.current) return false;
     if (!streamRef.current || finishingRef.current) return false;
@@ -243,6 +266,17 @@ export function useAzureSpeech(initialProps?: UseAzureSpeechProps) {
   reconnectRef.current = reconnect;
 
   const start = useCallback(async (): Promise<boolean> => {
+    if (
+      startingRef.current ||
+      recognizerRef.current ||
+      mediaRecorderRef.current
+    ) {
+      console.warn(
+        "[Recorder] start() ignored - a session is already starting or running",
+      );
+      return false;
+    }
+    startingRef.current = true;
     try {
       finishingRef.current = false;
       seenLangsRef.current = new Set();
@@ -450,8 +484,10 @@ export function useAzureSpeech(initialProps?: UseAzureSpeechProps) {
         handleDeviceChange,
       );
 
+      startingRef.current = false;
       return true;
     } catch (e: any) {
+      startingRef.current = false;
       callbacksRef.current.onError?.(e?.message || "Failed to start");
       return false;
     }
