@@ -36,6 +36,8 @@ services:
       - key: GATEWAY_TIMEOUT
         value: "60"
       - key: GATEWAY_PROXY_AI
+        value: "false"
+      - key: GATEWAY_PROXY_SUMMARY
         value: "true"
       - key: GATEWAY_AI_PROVIDER
         value: AzureOpenAI

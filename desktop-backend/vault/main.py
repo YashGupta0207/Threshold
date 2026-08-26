@@ -1303,9 +1303,14 @@ def _run_summary(transcript: str) -> str:
             + text[-half:]
         )
 
-    # Same switch that routes audio through the gateway, so metering is on or
-    # off for the whole vault rather than per feature.
-    if os.getenv("GATEWAY_PROXY_AI", "").strip().lower() in ("1", "true", "yes"):
+    # Summaries proxy on their own switch, separate from audio. Audio
+    # transcription burns enough tokens to trip the gateway's daily cap in a
+    # handful of calls, and a 429 there blocks diarisation outright; summaries
+    # are small and infrequent, so they can stay metered without that risk.
+    _proxy_summary = os.getenv("GATEWAY_PROXY_SUMMARY", "").strip().lower()
+    if not _proxy_summary:
+        _proxy_summary = os.getenv("GATEWAY_PROXY_AI", "").strip().lower()
+    if _proxy_summary in ("1", "true", "yes"):
         proxied = _summary_via_gateway(model, text)
         if proxied:
             return proxied
