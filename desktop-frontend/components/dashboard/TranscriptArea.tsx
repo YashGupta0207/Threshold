@@ -165,9 +165,9 @@ export default function TranscriptArea({
           <div className="flex h-full items-center justify-center">
             <p className="text-sm text-slate-400">Listening for voices...</p>
           </div>
-        ) : inPlayback ? (
+        ) : showSpeakers ? (
           <div className="space-y-4">
-            {(showSpeakers ? segments : []).map((seg, i) => (
+            {segments.map((seg, i) => (
               <div
                 key={i}
                 className="border-b border-gray-100 pb-4 last:border-b-0"
