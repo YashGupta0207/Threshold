@@ -38,10 +38,11 @@ import HighlightedText, {
   highlightRanges,
 } from "@/components/ui/HighlightedText";
 
-// How often the live speaker view refreshes while recording. Each refresh
-// re-diarises the whole recording so far, so this trades cost against how
-// far behind the speakers are allowed to fall.
-const LIVE_DIARISE_REFRESH_MS = 25000;
+// How often the live speaker view looks for work while recording. A pass only
+// starts when new speech has actually been recognised and none is already
+// running, so this is a poll interval, not a fixed cost: silence is free, and
+// the tail is picked up shortly after someone stops talking.
+const LIVE_DIARISE_POLL_MS = 5000;
 
 type TranscriptWord = {
   word: string;
@@ -221,6 +222,10 @@ export default function Dashboard() {
   // Lines covered by the last completed run, so a refresh is skipped when
   // nothing new has been said.
   const lastRunLinesRef = useRef(-1);
+  // Mirror the two in-flight flags so runLiveDiarisation can read them without
+  // listing them as dependencies (see the note in that callback).
+  const liveDiarisingRef = useRef(false);
+  const isDiarizingRef = useRef(false);
   const [transcriptParts, setTranscriptParts] = useState<string[]>([]);
   const [transcriptSegmentSeconds, setTranscriptSegmentSeconds] = useState(300);
   const [resolvedAudioDuration, setResolvedAudioDuration] = useState(0);
@@ -786,6 +791,7 @@ export default function Dashboard() {
   // stable instead of rebuilding it constantly.
   const linesRef = useRef<string[]>([]);
   linesRef.current = lines;
+  isDiarizingRef.current = isDiarizing;
 
   const liveTailText = useMemo(
     () => lines.slice(liveSegmentsUpTo).join("\n\n"),
@@ -950,7 +956,17 @@ export default function Dashboard() {
    * stay in step with a conversation that is still going.
    */
   const runLiveDiarisation = useCallback(async (announce: boolean) => {
-    if (liveDiarising || isDiarizing) return;
+    // Guarded by a ref, not by the liveDiarising state.
+    //
+    // This is the reason diarisation appeared to stop after the first pass.
+    // liveDiarising flips true then false on every pass, so with it in this
+    // callback's dependency list the callback was rebuilt twice per pass. The
+    // refresh effect depends on this callback, so each rebuild tore down the
+    // interval and started a fresh one -- the countdown restarted from zero
+    // every time a pass finished, and nothing else could ever schedule work.
+    // The ref keeps this callback stable, so the timer survives.
+    if (liveDiarisingRef.current || isDiarizingRef.current) return;
+    liveDiarisingRef.current = true;
     setLiveDiarising(true);
     if (announce) setStatusMessage("Separating speakers so far…");
     try {
@@ -959,6 +975,11 @@ export default function Dashboard() {
       // boundary, and anything recognised while the model runs belongs to
       // the tail.
       const coveredLines = linesRef.current.length;
+      // Mark the attempt now, not on success. Otherwise a pass that fails or
+      // finds no speech would leave the marker behind and the poll would retry
+      // it every few seconds forever. A later pass still happens as soon as
+      // new speech is recognised, which is the only thing worth retrying for.
+      lastRunLinesRef.current = coveredLines;
       if (!snapshotPath) {
         if (announce) setStatusMessage("Nothing recorded yet to separate.");
         return;
@@ -976,8 +997,10 @@ export default function Dashboard() {
       // previous result is what keeps speakers consistent and cannot duplicate
       // segments -- appending would do both.
       setLiveSegments(rows);
+      // Only a SUCCESSFUL pass moves the tail boundary, so a failure leaves
+      // everything since the last good result visible as plain text rather
+      // than silently swallowing it.
       setLiveSegmentsUpTo(coveredLines);
-      lastRunLinesRef.current = coveredLines;
       if (announce) {
         setStatusMessage(
           "Separating speakers as you record — press Transcribe for plain text.",
@@ -994,15 +1017,10 @@ export default function Dashboard() {
     } finally {
       stopSmoothProgress();
       setDiarizeProgress(0);
+      liveDiarisingRef.current = false;
       setLiveDiarising(false);
     }
-  }, [
-    liveDiarising,
-    isDiarizing,
-    snapshotAudioToFile,
-    handleDiarizeProgress,
-    stopSmoothProgress,
-  ]);
+  }, [snapshotAudioToFile, handleDiarizeProgress, stopSmoothProgress]);
 
   /** The button: start separating, or go back to plain text. */
   const handleToggleLiveDiarise = useCallback(() => {
@@ -1032,11 +1050,26 @@ export default function Dashboard() {
   useEffect(() => {
     if (!liveDiariseOn || !isRecording) return;
     const id = setInterval(() => {
+      // Nothing new said, or a pass already running: do nothing.
       if (linesRef.current.length === lastRunLinesRef.current) return;
+      if (liveDiarisingRef.current) return;
       void runLiveDiarisation(false);
-    }, LIVE_DIARISE_REFRESH_MS);
+    }, LIVE_DIARISE_POLL_MS);
     return () => clearInterval(id);
   }, [liveDiariseOn, isRecording, runLiveDiarisation]);
+
+  /**
+   * Final pass once recording stops.
+   *
+   * The last few seconds are always spoken after the previous pass, so without
+   * this they would sit in the tail forever and the finished result would be
+   * missing its ending.
+   */
+  useEffect(() => {
+    if (isRecording || !liveDiariseOn) return;
+    if (linesRef.current.length === lastRunLinesRef.current) return;
+    void runLiveDiarisation(false);
+  }, [isRecording, liveDiariseOn, runLiveDiarisation]);
 
   // Close the Diarise dropdown on an outside click or Escape.
   useEffect(() => {
