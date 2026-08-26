@@ -38,6 +38,11 @@ import HighlightedText, {
   highlightRanges,
 } from "@/components/ui/HighlightedText";
 
+// How often the live speaker view refreshes while recording. Each refresh
+// re-diarises the whole recording so far, so this trades cost against how
+// far behind the speakers are allowed to fall.
+const LIVE_DIARISE_REFRESH_MS = 25000;
+
 type TranscriptWord = {
   word: string;
   start: number;
@@ -209,6 +214,13 @@ export default function Dashboard() {
   // Anything past this is speech that arrived after the snapshot and is
   // shown as plain text underneath, so the panel never looks frozen.
   const [liveSegmentsUpTo, setLiveSegmentsUpTo] = useState(0);
+  // VIEW state, deliberately separate from the data above. Toggling this
+  // switches between the speaker view and plain text; it never touches
+  // liveSegments, lines or the recording, so switching cannot lose results.
+  const [liveDiariseOn, setLiveDiariseOn] = useState(false);
+  // Lines covered by the last completed run, so a refresh is skipped when
+  // nothing new has been said.
+  const lastRunLinesRef = useRef(-1);
   const [transcriptParts, setTranscriptParts] = useState<string[]>([]);
   const [transcriptSegmentSeconds, setTranscriptSegmentSeconds] = useState(300);
   const [resolvedAudioDuration, setResolvedAudioDuration] = useState(0);
@@ -569,6 +581,8 @@ export default function Dashboard() {
     setMergedTranscript([]);
     setLiveSegments([]);
     setLiveSegmentsUpTo(0);
+    setLiveDiariseOn(false);
+    lastRunLinesRef.current = -1;
     setTranscriptParts([]);
     setResolvedAudioDuration(0);
     setSessionTime(0);
@@ -935,10 +949,10 @@ export default function Dashboard() {
    * view. Pressing it again later re-runs over the longer audio, so speakers
    * stay in step with a conversation that is still going.
    */
-  const handleDiariseLive = useCallback(async () => {
+  const runLiveDiarisation = useCallback(async (announce: boolean) => {
     if (liveDiarising || isDiarizing) return;
     setLiveDiarising(true);
-    setStatusMessage("Separating speakers so far…");
+    if (announce) setStatusMessage("Separating speakers so far…");
     try {
       const snapshotPath = await snapshotAudioToFile();
       // Captured here, not after diarisation: the snapshot fixes the audio
@@ -946,7 +960,7 @@ export default function Dashboard() {
       // the tail.
       const coveredLines = linesRef.current.length;
       if (!snapshotPath) {
-        setStatusMessage("Nothing recorded yet to separate.");
+        if (announce) setStatusMessage("Nothing recorded yet to separate.");
         return;
       }
       const rows = (await diarizeAudioFile(snapshotPath, {
@@ -955,18 +969,28 @@ export default function Dashboard() {
       })) as MergedTranscriptRow[];
       stopSmoothProgress();
       if (rows.length === 0) {
-        setStatusMessage("No speech found in the recording so far.");
+        if (announce) setStatusMessage("No speech found in the recording so far.");
         return;
       }
+      // Each run diarises the whole recording from the start, so replacing the
+      // previous result is what keeps speakers consistent and cannot duplicate
+      // segments -- appending would do both.
       setLiveSegments(rows);
       setLiveSegmentsUpTo(coveredLines);
-      setStatusMessage(
-        "Speakers separated up to now — keep recording, or press it again later.",
-      );
+      lastRunLinesRef.current = coveredLines;
+      if (announce) {
+        setStatusMessage(
+          "Separating speakers as you record — press Transcribe for plain text.",
+        );
+      }
     } catch (e: any) {
       stopSmoothProgress();
       const reason = typeof e?.message === "string" ? e.message.trim() : "";
-      setStatusMessage(`⚠️ ${reason || "Could not separate speakers yet"}`);
+      // A failed refresh must not wipe the speakers already on screen, and a
+      // background refresh must not shout about it.
+      if (announce) {
+        setStatusMessage(`⚠️ ${reason || "Could not separate speakers yet"}`);
+      }
     } finally {
       stopSmoothProgress();
       setDiarizeProgress(0);
@@ -979,6 +1003,40 @@ export default function Dashboard() {
     handleDiarizeProgress,
     stopSmoothProgress,
   ]);
+
+  /** The button: start separating, or go back to plain text. */
+  const handleToggleLiveDiarise = useCallback(() => {
+    if (liveDiariseOn) {
+      // Plain-text view. liveSegments are kept, so switching back is instant
+      // and costs nothing.
+      setLiveDiariseOn(false);
+      setStatusMessage("Showing the plain transcript.");
+      return;
+    }
+    setLiveDiariseOn(true);
+    void runLiveDiarisation(true);
+  }, [liveDiariseOn, runLiveDiarisation]);
+
+  /**
+   * Keep the speakers current while the recording continues.
+   *
+   * The button used to be one-shot, which is why diarisation appeared to stop
+   * at the moment it was pressed. Each pass re-runs over the whole recording
+   * so far -- including everything said before the click -- and replaces the
+   * previous result, so nothing is duplicated and speaker numbering stays
+   * consistent within a pass.
+   *
+   * A pass is skipped when no new final line has been recognised since the
+   * last one, so silence costs nothing.
+   */
+  useEffect(() => {
+    if (!liveDiariseOn || !isRecording) return;
+    const id = setInterval(() => {
+      if (linesRef.current.length === lastRunLinesRef.current) return;
+      void runLiveDiarisation(false);
+    }, LIVE_DIARISE_REFRESH_MS);
+    return () => clearInterval(id);
+  }, [liveDiariseOn, isRecording, runLiveDiarisation]);
 
   // Close the Diarise dropdown on an outside click or Escape.
   useEffect(() => {
@@ -1022,6 +1080,8 @@ export default function Dashboard() {
     setMergedTranscript([]);
     setLiveSegments([]);
     setLiveSegmentsUpTo(0);
+    setLiveDiariseOn(false);
+    lastRunLinesRef.current = -1;
     setTranscriptParts([]);
     setResolvedAudioDuration(0);
     setIsSaved(false);
@@ -1356,6 +1416,8 @@ export default function Dashboard() {
     setMergedTranscript([]);
     setLiveSegments([]);
     setLiveSegmentsUpTo(0);
+    setLiveDiariseOn(false);
+    lastRunLinesRef.current = -1;
     setTranscriptParts([]);
     setResolvedAudioDuration(0);
     setUploadFile(null);
@@ -1986,11 +2048,13 @@ export default function Dashboard() {
                 ) : (
                   <TranscriptArea
                         onDiariseLive={
-                          isRecording ? handleDiariseLive : undefined
+                          isRecording ? handleToggleLiveDiarise : undefined
                         }
                         diarisingLive={liveDiarising}
-                        segments={liveSegments}
-                        tailText={liveTailText}
+                        diariseActive={liveDiariseOn}
+                        hasDiarisation={liveSegments.length > 0}
+                        segments={liveDiariseOn ? liveSegments : []}
+                        tailText={liveDiariseOn ? liveTailText : ""}
                     transcriptText={transcriptText}
                     editable={!isRecording}
                     onSave={handleSaveTranscript}

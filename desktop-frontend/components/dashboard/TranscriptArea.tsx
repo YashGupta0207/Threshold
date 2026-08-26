@@ -23,6 +23,10 @@ type TranscriptAreaProps = {
   diarisingLive?: boolean;
   /** Speech recognised after the segments were produced. */
   tailText?: string;
+  /** True while the speaker view is the active view mode. */
+  diariseActive?: boolean;
+  /** True once a diarisation result exists, so the label can say "Diarise". */
+  hasDiarisation?: boolean;
   onTranscriptEdit?: (text: string) => void;
 };
 
@@ -41,6 +45,8 @@ export default function TranscriptArea({
   onDiariseLive,
   diarisingLive,
   tailText = "",
+  diariseActive,
+  hasDiarisation,
   transcriptText,
   segments = [],
   audioUrl = null,
@@ -103,12 +109,20 @@ export default function TranscriptArea({
           {onDiariseLive && hasContent && (
             <button
               onClick={onDiariseLive}
-              disabled={diarisingLive}
+              disabled={diarisingLive && !diariseActive}
               title="Separate the speakers for what has been said so far"
               className="flex items-center gap-2 rounded-lg bg-white/20 px-3.5 py-2 text-sm font-semibold text-white ring-1 ring-white/30 transition-colors hover:bg-white/30 disabled:cursor-not-allowed disabled:opacity-50"
             >
               <Users className="h-4 w-4" />
-              {diarisingLive ? "Separating\u2026" : "Diarise now"}
+              {diariseActive
+                ? diarisingLive
+                  ? "Updating\u2026"
+                  : "Transcribe"
+                : diarisingLive
+                  ? "Separating\u2026"
+                  : hasDiarisation
+                    ? "Diarise"
+                    : "Diarise now"}
             </button>
           )}
           {editable && hasContent && (
@@ -204,7 +218,9 @@ export default function TranscriptArea({
             {tailText.trim() && (
               <div className="border-t border-dashed border-slate-200 pt-4">
                 <p className="mb-2 text-[11px] font-semibold uppercase tracking-widest text-slate-400">
-                  Still recording — not separated yet
+                  {diarisingLive
+                    ? "Separating the latest audio\u2026"
+                    : "Still recording — separated on the next pass"}
                 </p>
                 <p className="whitespace-pre-wrap text-[15px] leading-relaxed text-slate-500">
                   {tailText}
