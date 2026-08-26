@@ -56,11 +56,17 @@ export default function TranscriptArea({
     endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [transcriptText, segments, editMode]);
 
+  // Speakers are shown when they exist, but the running text stays one
+  // click away: a live session keeps transcribing after a snapshot was
+  // taken, so the segments are always slightly behind what was just said.
+  const [speakerView, setSpeakerView] = useState(true);
+  const showSpeakers = speakerView && segments.length > 0;
+
   const hasContent = transcriptText.trim().length > 0 || segments.length > 0;
-  const inPlayback = showPlayback && segments.length > 0 && !editMode;
+  const inPlayback = showPlayback && showSpeakers && !editMode;
 
   const fullText =
-    segments.length > 0
+    showSpeakers
       ? segments
           .map((s) => `${s.speaker}: ${stripSpeakerPrefix(s.text)}`)
           .join("\n\n")
@@ -93,6 +99,14 @@ export default function TranscriptArea({
           {inPlayback ? "Playback & Transcript" : "Conversation Transcript"}
         </h3>
         <div className="flex items-center gap-2">
+          {segments.length > 0 && (
+            <button
+              onClick={() => setSpeakerView((v) => !v)}
+              className="flex items-center gap-2 rounded-lg bg-white/20 px-3.5 py-2 text-sm font-semibold text-white ring-1 ring-white/30 transition-colors hover:bg-white/30"
+            >
+              {speakerView ? "Live text" : "Speakers"}
+            </button>
+          )}
           {onDiariseLive && hasContent && (
             <button
               onClick={onDiariseLive}
@@ -163,7 +177,7 @@ export default function TranscriptArea({
           </div>
         ) : inPlayback ? (
           <div className="space-y-4">
-            {segments.map((seg, i) => (
+            {(showSpeakers ? segments : []).map((seg, i) => (
               <div
                 key={i}
                 className="border-b border-gray-100 pb-4 last:border-b-0"

@@ -198,6 +198,13 @@ export default function Dashboard() {
   const [bgDiarising, setBgDiarising] = useState(false);
   // Separating speakers from a still-running recording.
   const [liveDiarising, setLiveDiarising] = useState(false);
+  // Speakers for a still-running session. Deliberately NOT
+  // mergedTranscript: that is the app's "this session is finished and
+  // diarised" signal, and setting it mid-recording swaps the whole panel
+  // for the playback view, hiding the transcript that is still growing.
+  const [liveSegments, setLiveSegments] = useState<MergedTranscriptRow[]>(
+    [],
+  );
   const [transcriptParts, setTranscriptParts] = useState<string[]>([]);
   const [transcriptSegmentSeconds, setTranscriptSegmentSeconds] = useState(300);
   const [resolvedAudioDuration, setResolvedAudioDuration] = useState(0);
@@ -556,6 +563,7 @@ export default function Dashboard() {
     setLines([]);
     setInterim("");
     setMergedTranscript([]);
+    setLiveSegments([]);
     setTranscriptParts([]);
     setResolvedAudioDuration(0);
     setSessionTime(0);
@@ -931,9 +939,7 @@ export default function Dashboard() {
         setStatusMessage("No speech found in the recording so far.");
         return;
       }
-      setMergedTranscript(rows);
-      setTranscriptView("diarize");
-      setIsSaved(false);
+      setLiveSegments(rows);
       setStatusMessage(
         "Speakers separated up to now — keep recording, or press it again later.",
       );
@@ -994,6 +1000,7 @@ export default function Dashboard() {
     setLines([]);
     setInterim("");
     setMergedTranscript([]);
+    setLiveSegments([]);
     setTranscriptParts([]);
     setResolvedAudioDuration(0);
     setIsSaved(false);
@@ -1326,6 +1333,7 @@ export default function Dashboard() {
     setLines([]);
     setInterim("");
     setMergedTranscript([]);
+    setLiveSegments([]);
     setTranscriptParts([]);
     setResolvedAudioDuration(0);
     setUploadFile(null);
@@ -1959,6 +1967,7 @@ export default function Dashboard() {
                           isRecording ? handleDiariseLive : undefined
                         }
                         diarisingLive={liveDiarising}
+                        segments={liveSegments}
                     transcriptText={transcriptText}
                     editable={!isRecording}
                     onSave={handleSaveTranscript}

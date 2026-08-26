@@ -719,12 +719,16 @@ export function useAzureSpeech(initialProps?: UseAzureSpeechProps) {
     const electron = typeof window !== "undefined" ? window.electronAPI : undefined;
     if (!electron?.audioFileCreate) return null;
 
-    if (recorder && recorder.state === "recording") {
+    // Flush while paused too. pause() calls MediaRecorder.pause(), which holds
+    // the slice recorded since the last ondataavailable in an internal buffer;
+    // skipping the flush there strands the final seconds of speech, which is
+    // exactly the audio someone is most likely to want labelled.
+    if (recorder && recorder.state !== "inactive") {
       try {
         recorder.requestData();
       } catch {}
       // Give ondataavailable a turn to land the flushed chunk.
-      await new Promise((r) => setTimeout(r, 120));
+      await new Promise((r) => setTimeout(r, 150));
     }
 
     const chunks = recordedChunksRef.current;
