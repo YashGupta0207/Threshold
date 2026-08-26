@@ -205,6 +205,10 @@ export default function Dashboard() {
   const [liveSegments, setLiveSegments] = useState<MergedTranscriptRow[]>(
     [],
   );
+  // How many recognised lines the current liveSegments already cover.
+  // Anything past this is speech that arrived after the snapshot and is
+  // shown as plain text underneath, so the panel never looks frozen.
+  const [liveSegmentsUpTo, setLiveSegmentsUpTo] = useState(0);
   const [transcriptParts, setTranscriptParts] = useState<string[]>([]);
   const [transcriptSegmentSeconds, setTranscriptSegmentSeconds] = useState(300);
   const [resolvedAudioDuration, setResolvedAudioDuration] = useState(0);
@@ -564,6 +568,7 @@ export default function Dashboard() {
     setInterim("");
     setMergedTranscript([]);
     setLiveSegments([]);
+    setLiveSegmentsUpTo(0);
     setTranscriptParts([]);
     setResolvedAudioDuration(0);
     setSessionTime(0);
@@ -763,6 +768,16 @@ export default function Dashboard() {
    */
   // Name the job after its opening words, the same shape handleSaveTranscript
   // uses, so a collected result is recognisable in MyMeetings later.
+  // lines changes on every recognised phrase; a ref keeps handleDiariseLive
+  // stable instead of rebuilding it constantly.
+  const linesRef = useRef<string[]>([]);
+  linesRef.current = lines;
+
+  const liveTailText = useMemo(
+    () => lines.slice(liveSegmentsUpTo).join("\n\n"),
+    [lines, liveSegmentsUpTo],
+  );
+
   const bgJobTopic = useMemo(() => {
     const words = transcriptText.trim().split(/\s+/).filter(Boolean).slice(0, 6);
     return words.length ? words.join(" ") : "Background diarisation";
@@ -926,6 +941,10 @@ export default function Dashboard() {
     setStatusMessage("Separating speakers so far…");
     try {
       const snapshotPath = await snapshotAudioToFile();
+      // Captured here, not after diarisation: the snapshot fixes the audio
+      // boundary, and anything recognised while the model runs belongs to
+      // the tail.
+      const coveredLines = linesRef.current.length;
       if (!snapshotPath) {
         setStatusMessage("Nothing recorded yet to separate.");
         return;
@@ -940,6 +959,7 @@ export default function Dashboard() {
         return;
       }
       setLiveSegments(rows);
+      setLiveSegmentsUpTo(coveredLines);
       setStatusMessage(
         "Speakers separated up to now — keep recording, or press it again later.",
       );
@@ -1001,6 +1021,7 @@ export default function Dashboard() {
     setInterim("");
     setMergedTranscript([]);
     setLiveSegments([]);
+    setLiveSegmentsUpTo(0);
     setTranscriptParts([]);
     setResolvedAudioDuration(0);
     setIsSaved(false);
@@ -1334,6 +1355,7 @@ export default function Dashboard() {
     setInterim("");
     setMergedTranscript([]);
     setLiveSegments([]);
+    setLiveSegmentsUpTo(0);
     setTranscriptParts([]);
     setResolvedAudioDuration(0);
     setUploadFile(null);
@@ -1968,6 +1990,7 @@ export default function Dashboard() {
                         }
                         diarisingLive={liveDiarising}
                         segments={liveSegments}
+                        tailText={liveTailText}
                     transcriptText={transcriptText}
                     editable={!isRecording}
                     onSave={handleSaveTranscript}

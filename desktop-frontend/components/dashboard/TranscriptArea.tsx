@@ -21,6 +21,8 @@ type TranscriptAreaProps = {
   /** Separate speakers for what has been recorded so far. */
   onDiariseLive?: () => void;
   diarisingLive?: boolean;
+  /** Speech recognised after the segments were produced. */
+  tailText?: string;
   onTranscriptEdit?: (text: string) => void;
 };
 
@@ -38,6 +40,7 @@ const SPEAKER_PALETTE = [
 export default function TranscriptArea({
   onDiariseLive,
   diarisingLive,
+  tailText = "",
   transcriptText,
   segments = [],
   audioUrl = null,
@@ -197,6 +200,17 @@ export default function TranscriptArea({
                 </p>
               </div>
             ))}
+
+            {tailText.trim() && (
+              <div className="border-t border-dashed border-slate-200 pt-4">
+                <p className="mb-2 text-[11px] font-semibold uppercase tracking-widest text-slate-400">
+                  Still recording — not separated yet
+                </p>
+                <p className="whitespace-pre-wrap text-[15px] leading-relaxed text-slate-500">
+                  {tailText}
+                </p>
+              </div>
+            )}
           </div>
         ) : (
           <p className="whitespace-pre-wrap text-[15px] leading-relaxed text-slate-700">
