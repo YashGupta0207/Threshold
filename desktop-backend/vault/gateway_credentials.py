@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 
 import httpx
 
@@ -49,14 +50,60 @@ GATEWAY_TIMEOUT = float(os.getenv("GATEWAY_TIMEOUT", "60"))
 # Flat {VARIABLE_NAME: value} map merged across every provider we fetched.
 _secrets: dict[str, str] = {}
 _loaded = False
+_last_attempt = 0.0
+
+# The gateway is itself on Render's free tier. If it happens to be spun down
+# when this process boots, the first request pays a ~50s cold start and can
+# still time out, so one attempt is not enough.
+_RETRY_DELAYS = (2.0, 5.0)
+
+# Ceiling on one whole load(), across every provider. load() runs at import, so
+# an unbounded retry budget would multiply by the provider count and stall boot
+# long enough for Render's health check to fail the deploy. Since a failed load
+# is no longer latched, giving up early costs nothing -- the next request
+# retries, by which point these attempts have usually woken the gateway anyway.
+_LOAD_BUDGET = 25.0
+
+# A failed load leaves _loaded False so a later call can retry. This is the
+# floor between those retries, so a broken gateway cannot be hammered once per
+# secret() call.
+_RETRY_COOLDOWN = 30.0
 
 
-def _fetch_provider(client: httpx.Client, provider: str) -> dict[str, str]:
-    """Fetch one provider's credentials. Returns {} on any failure."""
-    try:
-        resp = client.get(f"/gateway/credentials/{provider}")
-    except httpx.RequestError as exc:
-        log.warning("GATEWAY %-18s unreachable: %s", provider, exc)
+def _fetch_provider(
+    client: httpx.Client, provider: str, deadline: float
+) -> dict[str, str]:
+    """Fetch one provider's credentials. Returns {} on any failure.
+
+    Retries transport errors and 5xx, which is what a waking gateway looks
+    like. A 4xx is a real answer -- bad token, unknown provider, unauthorised
+    -- and retrying it would only delay the log line that explains the problem.
+    """
+    resp = None
+    for attempt, delay in enumerate((0.0,) + _RETRY_DELAYS):
+        if delay:
+            if time.monotonic() >= deadline:
+                log.warning(
+                    "GATEWAY %-18s giving up early, load budget spent", provider
+                )
+                break
+            time.sleep(delay)
+        try:
+            resp = client.get(f"/gateway/credentials/{provider}")
+        except httpx.RequestError as exc:
+            log.warning(
+                "GATEWAY %-18s unreachable (try %d): %s", provider, attempt + 1, exc
+            )
+            resp = None
+            continue
+        if resp.status_code < 500:
+            break
+        log.warning(
+            "GATEWAY %-18s HTTP %s (try %d), retrying",
+            provider, resp.status_code, attempt + 1,
+        )
+
+    if resp is None:
         return {}
 
     if resp.status_code != 200:
@@ -79,18 +126,32 @@ def _fetch_provider(client: httpx.Client, provider: str) -> dict[str, str]:
 
 
 def load() -> dict[str, str]:
-    """Fetch every configured provider once and merge the results."""
-    global _loaded
+    """Fetch every configured provider and merge the results.
+
+    Success is latched; failure is NOT. An earlier version set _loaded before
+    fetching, so one transient failure -- a gateway that happened to be cold at
+    boot -- left the process permanently secret-less and serving 500s until
+    somebody restarted it by hand. Now a failed attempt can be retried by the
+    next caller, subject to _RETRY_COOLDOWN.
+    """
+    global _loaded, _last_attempt
     if _loaded:
         return _secrets
-    _loaded = True
 
     if not GATEWAY_TOKEN:
+        _loaded = True
         log.info("GATEWAY disabled (no DXAI_API_KEY) — using .env values")
         return _secrets
     if not GATEWAY_PROVIDERS:
+        _loaded = True
         log.warning("GATEWAY DXAI_API_KEY is set but GATEWAY_PROVIDERS is empty")
         return _secrets
+
+    now = time.monotonic()
+    if _last_attempt and (now - _last_attempt) < _RETRY_COOLDOWN:
+        return _secrets
+    _last_attempt = now
+    deadline = now + _LOAD_BUDGET
 
     log.info(
         "GATEWAY fetching %d provider(s) from %s",
@@ -102,7 +163,7 @@ def load() -> dict[str, str]:
         timeout=GATEWAY_TIMEOUT,
     ) as client:
         for provider in GATEWAY_PROVIDERS:
-            for name, value in _fetch_provider(client, provider).items():
+            for name, value in _fetch_provider(client, provider, deadline).items():
                 if name in _secrets and _secrets[name] != value:
                     # Two providers exporting the same variable name is a
                     # config mistake worth shouting about — otherwise whichever
@@ -113,7 +174,15 @@ def load() -> dict[str, str]:
                     continue
                 _secrets[name] = value
 
-    log.info("GATEWAY resolved %d secret(s)", len(_secrets))
+    if _secrets:
+        _loaded = True
+        log.info("GATEWAY resolved %d secret(s)", len(_secrets))
+    else:
+        log.error(
+            "GATEWAY resolved 0 secret(s) — will retry in %.0fs. "
+            "Until it succeeds this vault cannot reach Cosmos or Azure.",
+            _RETRY_COOLDOWN,
+        )
     return _secrets
 
 

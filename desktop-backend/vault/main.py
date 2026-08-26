@@ -112,14 +112,35 @@ verified_emails: Dict[str, datetime] = {}
 _users_cont = None
 
 
+def cosmos_config() -> tuple[str, str, str]:
+    """Cosmos endpoint/key/database, re-read at call time.
+
+    The module-level constants are resolved once at import. If the gateway was
+    cold during that import they were bound to empty strings and would stay
+    empty for the life of the process, even after gateway_credentials
+    successfully retried. Reading through secret() here lets the vault recover
+    on its own instead of needing a manual restart.
+    """
+    endpoint = COSMOS_ENDPOINT or secret("COSMOS_ENDPOINT")
+    key = COSMOS_KEY or secret("COSMOS_KEY")
+    database = DATABASE_NAME or secret("COSMOS_DATABASE")
+    if not endpoint or not key or not database:
+        raise HTTPException(
+            status_code=503,
+            detail="The vault is still fetching its credentials. Please try again in a moment.",
+        )
+    return endpoint, key, database
+
+
 def get_users_container():
     global _users_cont
     if _users_cont is None:
-        if not COSMOS_ENDPOINT or not COSMOS_KEY or not DATABASE_NAME:
-            raise HTTPException(status_code=500, detail="Cosmos DB configuration is missing.")
-        client = CosmosClient(COSMOS_ENDPOINT, COSMOS_KEY)
-        database = client.get_database_client(DATABASE_NAME)
-        _users_cont = database.get_container_client(USERS_CONTAINER)
+        endpoint, key, database_name = cosmos_config()
+        client = CosmosClient(endpoint, key)
+        database = client.get_database_client(database_name)
+        _users_cont = database.get_container_client(
+            USERS_CONTAINER or secret("COSMOS_USERS_CONTAINER", "users")
+        )
     return _users_cont
 
 
@@ -1338,14 +1359,11 @@ def get_jobs_container():
     """The jobs container, created on first use so no manual setup is needed."""
     global _jobs_cont
     if _jobs_cont is None:
-        if not COSMOS_ENDPOINT or not COSMOS_KEY or not DATABASE_NAME:
-            raise HTTPException(
-                status_code=500, detail="Cosmos DB configuration is missing."
-            )
+        endpoint, key, database_name = cosmos_config()
         from azure.cosmos import PartitionKey
 
-        client = CosmosClient(COSMOS_ENDPOINT, COSMOS_KEY)
-        database = client.get_database_client(DATABASE_NAME)
+        client = CosmosClient(endpoint, key)
+        database = client.get_database_client(database_name)
         _jobs_cont = database.create_container_if_not_exists(
             id=secret("COSMOS_JOBS_CONTAINER", "diarizeJobs"),
             partition_key=PartitionKey(path="/email"),
