@@ -144,8 +144,12 @@ def get_users_container():
     return _users_cont
 
 
-def build_openai_client():
+def build_openai_client(force_direct: bool = False):
     """Azure OpenAI client — through the gateway proxy, or straight to Azure.
+
+    force_direct skips the proxy no matter what GATEWAY_PROXY_AI says. It
+    exists for the fallback in _proxy_or_direct(): metering must never be able
+    to take transcription down.
 
     Proxy mode (GATEWAY_PROXY_AI=true) routes calls via the gateway so they are
     metered: request counts and token usage show up against the developer token.
@@ -164,7 +168,11 @@ def build_openai_client():
     """
     from openai import OpenAI, AzureOpenAI
 
-    if os.getenv("GATEWAY_PROXY_AI", "").strip().lower() in ("1", "true", "yes"):
+    if not force_direct and os.getenv("GATEWAY_PROXY_AI", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
         gw_token = os.getenv("DXAI_API_KEY", "").strip()
         gw_base = (os.getenv("DXAI_BASE_URL") or "").strip().rstrip("/")
         if not gw_token or not gw_base:
@@ -1013,14 +1021,15 @@ def _renumber_speakers(segments: List[dict]) -> List[dict]:
 
 
 def _run_diarization(audio_bytes: bytes, filename: str, content_type: str = "") -> list:
-    client = build_openai_client()
     deployment = secret("AZURE_DIARIZE_DEPLOYMENT", "gpt-4o-transcribe-diarize").strip()
 
     safe_name = filename or "audio.ogg"
     mime = content_type or "audio/ogg"
 
-    resp = _create_diarized_transcription(
-        client, deployment, safe_name, audio_bytes, mime
+    resp = _proxy_or_direct(
+        lambda client: _create_diarized_transcription(
+            client, deployment, safe_name, audio_bytes, mime
+        )
     )
     data = (
         resp.model_dump()
@@ -1128,7 +1137,6 @@ async def diarize_stream(
 
 
 def _run_transcription(audio_bytes: bytes, filename: str, content_type: str = "") -> str:
-    client = build_openai_client()
     deployment = (
         secret("AZURE_TRANSCRIBE_DEPLOYMENT")
         or secret("AZURE_WHISPER_DEPLOYMENT")
@@ -1140,10 +1148,12 @@ def _run_transcription(audio_bytes: bytes, filename: str, content_type: str = ""
     # response, and without it the gateway has no token counts to record. The
     # transcript itself is identical — it just arrives as .text instead of a
     # bare string, which the return below already handles either way.
-    resp = client.audio.transcriptions.create(
-        model=deployment,
-        file=(safe_name, audio_bytes, mime),
-        response_format="json",
+    resp = _proxy_or_direct(
+        lambda client: client.audio.transcriptions.create(
+            model=deployment,
+            file=(safe_name, audio_bytes, mime),
+            response_format="json",
+        )
     )
     if isinstance(resp, str):
         return resp.strip()
@@ -1245,9 +1255,13 @@ def _summary_via_gateway(model: str, text: str) -> str | None:
         print(f"GATEWAY summary proxy unreachable, calling Gemini directly: {exc!r}")
         return None
 
-    if resp.status_code >= 500:
+    # 429 is a quota rejection, not a misconfiguration. Treat it like a gateway
+    # fault and fall back, so an exhausted cap cannot take summaries down --
+    # matching what _proxy_or_direct() does for audio.
+    if resp.status_code >= 500 or resp.status_code == 429:
         print(
-            "GATEWAY summary proxy HTTP %s, calling Gemini directly: %s"
+            "GATEWAY summary proxy unusable (HTTP %s), calling Gemini directly "
+            "— this call will NOT be metered: %s"
             % (resp.status_code, resp.text[:200])
         )
         return None
@@ -1272,6 +1286,43 @@ def _summary_via_gateway(model: str, text: str) -> str | None:
         return None
     content = ((choices[0].get("message") or {}).get("content") or "").strip()
     return content or None
+
+
+def _proxy_or_direct(call):
+    """Run an Azure call through the gateway, falling back to a direct call.
+
+    Everything should be counted, but the gateway enforces per-token daily and
+    monthly caps on its proxy paths, and audio transcription spends tokens fast
+    enough to reach them. A 429 there would otherwise fail diarisation
+    outright -- metering would be taking the product down.
+
+    So the proxied attempt comes first, and only a quota rejection or a gateway
+    fault drops to a direct call. Provider errors (bad audio, unsupported
+    format) are raised untouched: retrying those directly would just repeat the
+    same failure and hide where it came from.
+
+    `call` takes the client and returns the provider response.
+    """
+    proxied = os.getenv("GATEWAY_PROXY_AI", "").strip().lower() in ("1", "true", "yes")
+    if not proxied:
+        return call(build_openai_client())
+
+    try:
+        return call(build_openai_client())
+    except Exception as exc:
+        status = getattr(exc, "status_code", None) or getattr(
+            getattr(exc, "response", None), "status_code", None
+        )
+        body = str(getattr(exc, "message", "") or exc)
+        quota_hit = status == 429 or "limit exceeded" in body.lower()
+        gateway_down = status is not None and status >= 500
+        if not (quota_hit or gateway_down):
+            raise
+        print(
+            "GATEWAY proxy unusable for this call (%s), retrying direct — "
+            "this call will NOT be metered: %s" % (status, body[:200])
+        )
+        return call(build_openai_client(force_direct=True))
 
 
 def _run_summary(transcript: str) -> str:
