@@ -21,6 +21,7 @@ import {
   MEETINGS_EVENT,
 } from "@/lib/meetingStore";
 import { diarizeAudioFile } from "@/lib/diarize";
+import { createDiariseJob } from "@/lib/diarizeJobs";
 import { summarizeTranscript } from "@/lib/summary";
 import SummaryText from "@/components/ui/SummaryText";
 import AudioPlayer from "@/components/ui/AudioPlayer";
@@ -119,6 +120,10 @@ export default function MyMeetings() {
   const [summaryError, setSummaryError] = useState<string | null>(null);
   const summaryAbortRef = useRef<AbortController | null>(null);
   const [showDiarizeConfirm, setShowDiarizeConfirm] = useState(false);
+  // Confirmation that a background job was accepted. Cleared when the
+  // open meeting changes, alongside the summary.
+  const [bgNotice, setBgNotice] = useState<string | null>(null);
+  const [bgQueuing, setBgQueuing] = useState(false);
   const [diarizing, setDiarizing] = useState(false);
   const [diarizeProgress, setDiarizeProgress] = useState(0);
   const [showDiarizeRetry, setShowDiarizeRetry] = useState(false);
@@ -134,6 +139,36 @@ export default function MyMeetings() {
     setSummarising(false);
     setSummaryText("");
     setSummaryError(null);
+  };
+
+  /**
+   * Queue this meeting for diarisation on the server.
+   *
+   * The job carries meeting.id, so when the result is collected it is attached
+   * to this very meeting rather than creating a second, audio-less copy of it.
+   */
+  const runBackgroundDiarise = async (meeting: Meeting) => {
+    setShowDiarizeConfirm(false);
+    if (!meeting.audioPath || bgQueuing) return;
+    setBgQueuing(true);
+    setBgNotice("Uploading audio…");
+    try {
+      await createDiariseJob(meeting.audioPath, {
+        jwt: localStorage.getItem("token"),
+        topic: meeting.topic,
+        meetingId: meeting.id,
+        durationSec: meeting.durationSec || 0,
+      });
+      setBgNotice(
+        "Diarising on the server — you can close the app. The speakers will " +
+          "appear on this meeting once it finishes.",
+      );
+    } catch (e: any) {
+      const reason = typeof e?.message === "string" ? e.message.trim() : "";
+      setBgNotice(`Could not queue this meeting: ${reason || "unknown error"}`);
+    } finally {
+      setBgQueuing(false);
+    }
   };
 
   const handleSummarise = async () => {
@@ -193,6 +228,7 @@ export default function MyMeetings() {
     setSummarising(false);
     setSummaryText("");
     setSummaryError(null);
+    setBgNotice(null);
   }, [openMeetingId]);
 
   const [mtgHighlights, setMtgHighlights] = useState<string[]>([]);
@@ -1075,6 +1111,14 @@ export default function MyMeetings() {
               </button>
             </div>
 
+            {bgNotice && (
+              <div className="border-b border-teal-100 bg-teal-50 px-6 py-2.5">
+                <p className="text-xs font-semibold leading-snug text-teal-800">
+                  {bgNotice}
+                </p>
+              </div>
+            )}
+
             <div
               ref={mtgScrollRef}
               onMouseUp={handleMtgMouseUp}
@@ -1368,18 +1412,30 @@ export default function MyMeetings() {
                   We&apos;ll separate the speakers using the original audio. This
                   can take a little while.
                 </p>
-                <div className="mt-7 flex gap-3">
-                  <button
-                    onClick={() => setShowDiarizeConfirm(false)}
-                    className="flex-1 rounded-xl bg-slate-100 py-3 text-sm font-bold text-slate-700 transition-colors hover:bg-slate-200"
-                  >
-                    Cancel
-                  </button>
+                <div className="mt-7 space-y-2">
                   <button
                     onClick={() => runReDiarize(selectedMeeting)}
-                    className="flex-1 rounded-xl bg-linear-to-r from-violet-500 to-blue-500 py-3 text-sm font-bold text-white shadow-lg shadow-violet-500/25 transition-all hover:from-violet-600 hover:to-blue-600"
+                    className="w-full rounded-xl bg-linear-to-r from-violet-500 to-blue-500 py-3 text-sm font-bold text-white shadow-lg shadow-violet-500/25 transition-all hover:from-violet-600 hover:to-blue-600"
                   >
-                    Diarise
+                    Diarise now
+                    <span className="mt-0.5 block text-[10px] font-medium text-white/80">
+                      Keep this window open until it finishes
+                    </span>
+                  </button>
+                  <button
+                    onClick={() => runBackgroundDiarise(selectedMeeting)}
+                    className="w-full rounded-xl bg-linear-to-r from-[#2FB5AA] to-[#2E6DBE] py-3 text-sm font-bold text-white shadow-lg shadow-teal-500/25 transition-all hover:from-[#28a29a] hover:to-[#2a61a8]"
+                  >
+                    Diarise in background
+                    <span className="mt-0.5 block text-[10px] font-medium text-white/80">
+                      Runs on the server — you can close the app
+                    </span>
+                  </button>
+                  <button
+                    onClick={() => setShowDiarizeConfirm(false)}
+                    className="w-full rounded-xl bg-slate-100 py-3 text-sm font-bold text-slate-700 transition-colors hover:bg-slate-200"
+                  >
+                    Cancel
                   </button>
                 </div>
               </>

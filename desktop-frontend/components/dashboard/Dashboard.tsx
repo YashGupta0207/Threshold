@@ -21,6 +21,7 @@ import TranscriptArea from "./TranscriptArea";
 import {
   loadMeetings,
   addMeeting,
+  updateMeeting,
   MEETINGS_EVENT,
 } from "@/lib/meetingStore";
 import { getUserName, clearSession } from "@/lib/auth";
@@ -184,6 +185,12 @@ export default function Dashboard() {
   // and the player's resolved length. Together these let us synthesise word
   // timings so the transcript view highlights in sync like the diarize view.
   const [showDiariseMenu, setShowDiariseMenu] = useState(false);
+  // handleSaveTranscript is defined further down, so it cannot be named in
+  // this callback's dependency list. The ref is assigned right after that
+  // declaration and always holds the current version.
+  const saveTranscriptRef = useRef<
+    (() => Promise<string | null>) | null
+  >(null);
   const diariseMenuRef = useRef<HTMLDivElement | null>(null);
   // Tracks only the upload leg of a background job. Kept separate from
   // isDiarizing because that flag disables recording and upload app-wide, and
@@ -756,12 +763,22 @@ export default function Dashboard() {
     }
     setDiarizeError(null);
     setBgDiarising(true);
-    setStatusMessage("Uploading audio for background diarisation…");
+    setStatusMessage("Saving the meeting…");
     try {
+      // Save first so the job has a real meeting to attach its speakers to.
+      // Without this the collected result had nowhere to go and became a
+      // second, audio-less entry sitting beside the original -- two rows for
+      // one recording, the diarised one with no player and the original still
+      // offering to diarise work that was already done.
+      const meetingId =
+        savedMeetingId || (await saveTranscriptRef.current?.()) || null;
+      if (!meetingId) throw new Error("Could not save this meeting first.");
+
+      setStatusMessage("Uploading audio for background diarisation…");
       await createDiariseJob(audioFilePath, {
         jwt: localStorage.getItem("token"),
         topic: bgJobTopic,
-        meetingId: savedMeetingId || "",
+        meetingId,
         durationSec: playbackDurationSec || sessionTime || 0,
       });
       setStatusMessage(
@@ -825,19 +842,35 @@ export default function Dashboard() {
         }
 
         try {
-          addMeeting({
-            id: job.meeting_id || `job-${job.job_id}`,
-            topic: job.topic || "Background diarisation",
-            date: job.completed_at || job.created_at || new Date().toISOString(),
-            transcript: rows.map((r) => ({
-              speaker: r.speaker,
-              text: r.text,
-              timestamp: "",
-            })),
-            durationSec: job.duration_sec || 0,
-            plainText: rows.map((r) => r.text).join("\n\n"),
-            diarized: rows,
-          } as any);
+          // Attach to the meeting the job was started from, so one recording
+          // stays one row: it keeps its audio (and therefore its player) and
+          // simply gains speakers. Only fall back to creating a row if that
+          // meeting is gone -- otherwise the result would be lost.
+          const existing = job.meeting_id
+            ? loadMeetings().find((m) => m.id === job.meeting_id)
+            : undefined;
+
+          if (existing) {
+            updateMeeting(existing.id, {
+              diarized: rows,
+              plainText: existing.plainText || rows.map((r) => r.text).join("\n\n"),
+            });
+          } else {
+            addMeeting({
+              id: job.meeting_id || `job-${job.job_id}`,
+              topic: job.topic || "Background diarisation",
+              date:
+                job.completed_at || job.created_at || new Date().toISOString(),
+              transcript: rows.map((r) => ({
+                speaker: r.speaker,
+                text: r.text,
+                timestamp: "",
+              })),
+              durationSec: job.duration_sec || 0,
+              plainText: rows.map((r) => r.text).join("\n\n"),
+              diarized: rows,
+            } as any);
+          }
           collected += 1;
           await ackJob(job.job_id, token);
         } catch {
@@ -1042,8 +1075,10 @@ export default function Dashboard() {
     setStatusMessage(ok ? "Copied to clipboard" : "Copy failed");
   }, [transcriptView, mergedTranscript, transcriptText]);
 
-  const handleSaveTranscript = useCallback(async () => {
-    if (!transcriptText.trim() && mergedTranscript.length === 0) return;
+  const handleSaveTranscript = useCallback(async (): Promise<
+    string | null
+  > => {
+    if (!transcriptText.trim() && mergedTranscript.length === 0) return null;
     const sid = sessionIdRef.current;
     const kind = transcriptView === "diarize" ? "Diarised" : "Transcript";
     const baseName = `ThreadNotes_${kind}_${new Date().toISOString().slice(0, 10)}`;
@@ -1170,8 +1205,10 @@ export default function Dashboard() {
         setIsSaved(true);
         setStatusMessage("✅ Saved!");
       }
+      return record.id;
     } catch {
       if (sid === sessionIdRef.current) setStatusMessage("⚠️ Save failed");
+      return null;
     } finally {
       if (sid === sessionIdRef.current) {
         setIsSaving(false);
@@ -1190,6 +1227,8 @@ export default function Dashboard() {
     showHighlights,
     getRecordingFilePath,
   ]);
+
+  saveTranscriptRef.current = handleSaveTranscript;
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
