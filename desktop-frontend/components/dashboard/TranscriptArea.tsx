@@ -1,6 +1,6 @@
 "use client";
 import { useState, useRef, useEffect } from "react";
-import { Upload, Pencil, Check } from "lucide-react";
+import { Upload, Pencil, Check, Users } from "lucide-react";
 
 export type Word = { word: string; start: number; end: number };
 export type Segment = {
@@ -18,6 +18,9 @@ type TranscriptAreaProps = {
   showPlayback?: boolean;
   editable?: boolean;
   onSave?: () => void;
+  /** Separate speakers for what has been recorded so far. */
+  onDiariseLive?: () => void;
+  diarisingLive?: boolean;
   onTranscriptEdit?: (text: string) => void;
 };
 
@@ -33,6 +36,8 @@ const SPEAKER_PALETTE = [
 ];
 
 export default function TranscriptArea({
+  onDiariseLive,
+  diarisingLive,
   transcriptText,
   segments = [],
   audioUrl = null,
@@ -88,6 +93,17 @@ export default function TranscriptArea({
           {inPlayback ? "Playback & Transcript" : "Conversation Transcript"}
         </h3>
         <div className="flex items-center gap-2">
+          {onDiariseLive && hasContent && (
+            <button
+              onClick={onDiariseLive}
+              disabled={diarisingLive}
+              title="Separate the speakers for what has been said so far"
+              className="flex items-center gap-2 rounded-lg bg-white/20 px-3.5 py-2 text-sm font-semibold text-white ring-1 ring-white/30 transition-colors hover:bg-white/30 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <Users className="h-4 w-4" />
+              {diarisingLive ? "Separating\u2026" : "Diarise now"}
+            </button>
+          )}
           {editable && hasContent && (
             <button
               onClick={toggleEdit}

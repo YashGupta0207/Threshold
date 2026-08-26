@@ -196,6 +196,8 @@ export default function Dashboard() {
   // isDiarizing because that flag disables recording and upload app-wide, and
   // a background job must not lock anything.
   const [bgDiarising, setBgDiarising] = useState(false);
+  // Separating speakers from a still-running recording.
+  const [liveDiarising, setLiveDiarising] = useState(false);
   const [transcriptParts, setTranscriptParts] = useState<string[]>([]);
   const [transcriptSegmentSeconds, setTranscriptSegmentSeconds] = useState(300);
   const [resolvedAudioDuration, setResolvedAudioDuration] = useState(0);
@@ -289,6 +291,7 @@ export default function Dashboard() {
     pause,
     resume,
     finishRecording,
+    snapshotAudioToFile,
     getRecordingFilePath,
     cancel,
     micLabel,
@@ -896,6 +899,60 @@ export default function Dashboard() {
       cancelled = true;
     };
   }, []);
+
+  /**
+   * Separate the speakers for what has been said so far, mid-recording.
+   *
+   * Diarisation needs a file and the session's own recording is not written
+   * until it finishes, so this works from a throwaway snapshot of the buffered
+   * audio. Recording is never interrupted: the mic keeps running and the final
+   * recording still covers the whole session.
+   *
+   * Results go to mergedTranscript, which switches the panel to the speaker
+   * view. Pressing it again later re-runs over the longer audio, so speakers
+   * stay in step with a conversation that is still going.
+   */
+  const handleDiariseLive = useCallback(async () => {
+    if (liveDiarising || isDiarizing) return;
+    setLiveDiarising(true);
+    setStatusMessage("Separating speakers so far…");
+    try {
+      const snapshotPath = await snapshotAudioToFile();
+      if (!snapshotPath) {
+        setStatusMessage("Nothing recorded yet to separate.");
+        return;
+      }
+      const rows = (await diarizeAudioFile(snapshotPath, {
+        jwt: localStorage.getItem("token"),
+        onProgress: handleDiarizeProgress,
+      })) as MergedTranscriptRow[];
+      stopSmoothProgress();
+      if (rows.length === 0) {
+        setStatusMessage("No speech found in the recording so far.");
+        return;
+      }
+      setMergedTranscript(rows);
+      setTranscriptView("diarize");
+      setIsSaved(false);
+      setStatusMessage(
+        "Speakers separated up to now — keep recording, or press it again later.",
+      );
+    } catch (e: any) {
+      stopSmoothProgress();
+      const reason = typeof e?.message === "string" ? e.message.trim() : "";
+      setStatusMessage(`⚠️ ${reason || "Could not separate speakers yet"}`);
+    } finally {
+      stopSmoothProgress();
+      setDiarizeProgress(0);
+      setLiveDiarising(false);
+    }
+  }, [
+    liveDiarising,
+    isDiarizing,
+    snapshotAudioToFile,
+    handleDiarizeProgress,
+    stopSmoothProgress,
+  ]);
 
   // Close the Diarise dropdown on an outside click or Escape.
   useEffect(() => {
@@ -1898,6 +1955,10 @@ export default function Dashboard() {
                   </div>
                 ) : (
                   <TranscriptArea
+                        onDiariseLive={
+                          isRecording ? handleDiariseLive : undefined
+                        }
+                        diarisingLive={liveDiarising}
                     transcriptText={transcriptText}
                     editable={!isRecording}
                     onSave={handleSaveTranscript}

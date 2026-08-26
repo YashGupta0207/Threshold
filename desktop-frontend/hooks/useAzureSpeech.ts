@@ -700,11 +700,60 @@ export function useAzureSpeech(initialProps?: UseAzureSpeechProps) {
     recordedChunksRef.current = [];
   }, [cleanupStreams]);
 
+  /**
+   * Write everything captured so far to its own file, without disturbing the
+   * recording, so speakers can be separated mid-session.
+   *
+   * Diarisation needs a file, and the real recording is only written when the
+   * session finishes. The buffered chunks are still a complete stream on their
+   * own -- chunk 0 carries the EBML header -- so a blob built from them decodes
+   * on its own. requestData() is called first because MediaRecorder holds the
+   * current timeslice in an internal buffer that ondataavailable has not seen
+   * yet, and without flushing it the snapshot stops a second short.
+   *
+   * The file is a throwaway copy: the session keeps recording into its own
+   * buffer and still produces the full recording at the end.
+   */
+  const snapshotAudioToFile = useCallback(async (): Promise<string | null> => {
+    const recorder = mediaRecorderRef.current;
+    const electron = typeof window !== "undefined" ? window.electronAPI : undefined;
+    if (!electron?.audioFileCreate) return null;
+
+    if (recorder && recorder.state === "recording") {
+      try {
+        recorder.requestData();
+      } catch {}
+      // Give ondataavailable a turn to land the flushed chunk.
+      await new Promise((r) => setTimeout(r, 120));
+    }
+
+    const chunks = recordedChunksRef.current;
+    if (!chunks.length) return null;
+
+    const blob = new Blob(chunks, {
+      type: chunks[0]?.type || "audio/webm",
+    });
+    if (blob.size === 0) return null;
+
+    const path = await electron.audioFileCreate();
+    const buf = await blob.arrayBuffer();
+    const CHUNK = 4 * 1024 * 1024;
+    let offset = 0;
+    while (offset < buf.byteLength) {
+      const end = Math.min(offset + CHUNK, buf.byteLength);
+      await electron.audioFileAppend(path, buf.slice(offset, end));
+      offset = end;
+    }
+    await electron.audioFileClose(path);
+    return path;
+  }, []);
+
   return {
     start,
     pause,
     resume,
     finishRecording,
+    snapshotAudioToFile,
     getRecordingFilePath,
     cancel,
     micLabel,
