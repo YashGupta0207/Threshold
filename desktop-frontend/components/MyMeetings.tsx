@@ -183,6 +183,17 @@ export default function MyMeetings() {
       return;
     }
 
+    // Fall back to storage before calling the model. Component state can be
+    // behind -- selectedMeeting is a snapshot taken when the meeting was
+    // opened -- so checking here is what guarantees a summary is generated
+    // once per meeting rather than once per stale copy.
+    const stored = loadMeetings().find((m) => m.id === selectedMeeting.id);
+    if (stored?.summary) {
+      setSummaryText(stored.summary);
+      setShowSummary(true);
+      return;
+    }
+
     // Always summarise the unlabelled transcript, whichever view is open.
     // Feeding it "Speaker 1: ..." made the model summarise who spoke rather
     // than what was discussed, producing "Speaker 2 proposed..." bullets
@@ -206,6 +217,13 @@ export default function MyMeetings() {
       // Persist immediately: the next open reads this instead of calling the
       // model again.
       updateMeeting(selectedMeeting.id, { summary });
+      // And keep the open meeting in step. Without this it stays a pre-summary
+      // snapshot, and the next patch built from it -- diarising, renaming a
+      // speaker, toggling highlights, all of which do { ...meeting, ... } --
+      // would put a summary-less copy back into the list.
+      setSelectedMeeting((prev) =>
+        prev && prev.id === selectedMeeting.id ? { ...prev, summary } : prev,
+      );
     } catch (e: any) {
       if (controller.signal.aborted || e?.name === "AbortError") return;
       setSummaryError(
