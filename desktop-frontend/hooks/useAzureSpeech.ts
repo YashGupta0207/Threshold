@@ -266,17 +266,28 @@ export function useAzureSpeech(initialProps?: UseAzureSpeechProps) {
   reconnectRef.current = reconnect;
 
   const start = useCallback(async (): Promise<boolean> => {
-    if (
-      startingRef.current ||
-      recognizerRef.current ||
-      mediaRecorderRef.current
-    ) {
-      console.warn(
-        "[Recorder] start() ignored - a session is already starting or running",
-      );
+    // Only a concurrent start is refused.
+    //
+    // This used to also refuse when recognizerRef or mediaRecorderRef were
+    // still set, which meant any session that ended abnormally -- a failed
+    // start, an error mid-session -- left one of them populated and blocked
+    // recording permanently, reporting only "Couldn't start recording". Those
+    // leftovers are now torn down instead. Two recognisers or two recorders
+    // still cannot run at once, which is what the guard was for.
+    if (startingRef.current) {
+      console.warn("[Recorder] start() ignored - one is already starting");
       return false;
     }
     startingRef.current = true;
+
+    // initRecognizer disposes a stale recogniser; this covers the recorder.
+    const staleRecorder = mediaRecorderRef.current;
+    if (staleRecorder) {
+      mediaRecorderRef.current = null;
+      try {
+        if (staleRecorder.state !== "inactive") staleRecorder.stop();
+      } catch {}
+    }
     try {
       finishingRef.current = false;
       seenLangsRef.current = new Set();
@@ -484,12 +495,14 @@ export function useAzureSpeech(initialProps?: UseAzureSpeechProps) {
         handleDeviceChange,
       );
 
-      startingRef.current = false;
       return true;
     } catch (e: any) {
-      startingRef.current = false;
       callbacksRef.current.onError?.(e?.message || "Failed to start");
       return false;
+    } finally {
+      // In a finally so an early return added later cannot strand the flag and
+      // lock the user out of recording.
+      startingRef.current = false;
     }
   }, [fetchAzureToken, initRecognizer, startRenewalLoop]);
 
