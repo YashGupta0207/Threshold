@@ -310,8 +310,16 @@ export default function Dashboard() {
     setLines((prev) => [...prev, text]);
   }, []);
 
+  // Remembers why a start failed. start() reports through onError and then
+  // returns false, and handleStart's own message used to overwrite it -- so
+  // the real reason was set and immediately replaced by a generic one,
+  // leaving "Couldn't start recording" as the only thing anyone ever saw.
+  const startErrorRef = useRef<string | null>(null);
+
   const handleAzureError = useCallback((msg: string) => {
-    if (msg) setStatusMessage(`⚠️ ${msg}`);
+    if (!msg) return;
+    startErrorRef.current = msg;
+    setStatusMessage(`⚠️ ${msg}`);
   }, []);
 
   const {
@@ -604,6 +612,7 @@ export default function Dashboard() {
     setHighlightsOnly(false);
     setHlButton(null);
     setStatusMessage(null);
+    startErrorRef.current = null;
     const ok = await start();
     if (ok) {
       startedAtRef.current = Date.now();
@@ -612,7 +621,9 @@ export default function Dashboard() {
       setIsPaused(false);
       setStatusMessage("Listening...");
     } else {
-      setStatusMessage("⚠️ Couldn't start recording");
+      setStatusMessage(
+        `⚠️ ${startErrorRef.current || "Couldn't start recording"}`,
+      );
     }
   }, [start, clearPlayback]);
 

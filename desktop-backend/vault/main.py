@@ -778,17 +778,35 @@ def admin_delete_user(user_id: str, admin: dict = Depends(get_current_admin)):
 
 @app.get("/azure/token")
 async def get_azure_speech_token(user: dict = Depends(get_current_user)):
-    if not AZURE_SPEECH_KEY or not AZURE_SPEECH_REGION:
-        raise HTTPException(status_code=500, detail="Azure Speech configuration is missing.")
+    # Re-read at call time, exactly like cosmos_config().
+    #
+    # The module constants are bound once at import. If the gateway happened to
+    # be cold then, they were bound to empty strings and stayed empty for the
+    # life of the process -- so live recording failed with "Azure Speech
+    # configuration is missing" forever, while every other feature recovered
+    # once gateway_credentials retried. This endpoint is the only user of those
+    # two constants, which is why recording was the one thing that stayed
+    # broken.
+    speech_key = (AZURE_SPEECH_KEY or secret("AZURE_SPEECH_KEY")).strip()
+    speech_region = (AZURE_SPEECH_REGION or secret("AZURE_SPEECH_REGION")).strip()
 
-    sts_url = f"https://{AZURE_SPEECH_REGION}.api.cognitive.microsoft.com/sts/v1.0/issueToken"
+    if not speech_key or not speech_region:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "The vault is still fetching its speech credentials. "
+                "Please try again in a moment."
+            ),
+        )
+
+    sts_url = f"https://{speech_region}.api.cognitive.microsoft.com/sts/v1.0/issueToken"
 
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             response = await client.post(
                 sts_url,
                 headers={
-                    "Ocp-Apim-Subscription-Key": AZURE_SPEECH_KEY,
+                    "Ocp-Apim-Subscription-Key": speech_key,
                     "Content-Length": "0",
                 },
             )
@@ -796,7 +814,7 @@ async def get_azure_speech_token(user: dict = Depends(get_current_user)):
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Azure token request failed: {exc}")
 
-    return {"token": response.text, "region": AZURE_SPEECH_REGION}
+    return {"token": response.text, "region": speech_region}
 
 
 _NOISE_ANNOTATION = re.compile(

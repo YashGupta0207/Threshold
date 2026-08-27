@@ -83,10 +83,19 @@ export function useAzureSpeech(initialProps?: UseAzureSpeechProps) {
       headers: { Authorization: `Bearer ${jwt}` },
     });
     if (!res.ok) {
+      // Include the server's own explanation; a bare status code sent people
+      // hunting through client code for what was actually a vault-side
+      // problem.
+      let detail = "";
+      try {
+        detail = (await res.json())?.detail || "";
+      } catch {
+        /* body was not JSON */
+      }
       throw new Error(
         res.status === 401
-          ? "Azure token request unauthorized (401) — your login session likely expired."
-          : `Token fetch failed: ${res.status}`,
+          ? "Your login session has expired — please sign in again."
+          : detail || `The vault could not issue a speech token (${res.status}).`,
       );
     }
     return res.json();
