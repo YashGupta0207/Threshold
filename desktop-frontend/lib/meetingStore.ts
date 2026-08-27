@@ -21,6 +21,12 @@ export type StoredMeeting = {
   audioMediaUrl?: string;
   highlights?: string[];
   highlightsShown?: boolean;
+  /**
+   * The AI summary, kept so it is generated once per meeting. Reopening a
+   * meeting shows the stored copy rather than paying for the same completion
+   * again.
+   */
+  summary?: string;
 };
 
 function currentUserId(): string {

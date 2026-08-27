@@ -40,6 +40,7 @@ type Meeting = {
   audioMediaUrl?: string;
   highlights?: string[];
   highlightsShown?: boolean;
+  summary?: string;
 };
 
 type DiarizedRow = {
@@ -204,6 +205,9 @@ export default function MyMeetings() {
       });
       if (controller.signal.aborted) return;
       setSummaryText(summary);
+      // Persist immediately: the next open reads this instead of calling the
+      // model again.
+      updateMeeting(selectedMeeting.id, { summary });
     } catch (e: any) {
       if (controller.signal.aborted || e?.name === "AbortError") return;
       setSummaryError(
@@ -226,9 +230,12 @@ export default function MyMeetings() {
     summaryAbortRef.current = null;
     setShowSummary(false);
     setSummarising(false);
-    setSummaryText("");
+    // Load the stored summary rather than clearing it, so reopening a meeting
+    // shows what was already generated and never asks for it twice.
+    setSummaryText(selectedMeeting?.summary ?? "");
     setSummaryError(null);
     setBgNotice(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [openMeetingId]);
 
   const [mtgHighlights, setMtgHighlights] = useState<string[]>([]);
@@ -1056,6 +1063,7 @@ export default function MyMeetings() {
                   />
                 </div>
               )}
+              <div className="flex shrink-0 flex-col gap-1.5">
               <button
                 onClick={() => {
                   if (diarizing) return;
@@ -1109,6 +1117,7 @@ export default function MyMeetings() {
                     ? "Hide Summary"
                     : "AI Summary"}
               </button>
+              </div>
             </div>
 
             {bgNotice && (

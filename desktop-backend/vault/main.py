@@ -1201,9 +1201,11 @@ SUMMARY_SYSTEM_PROMPT = (
     "## Action Items\n"
     "Bullet points of who agreed to do what. Name the person when the "
     "transcript makes it clear, and do not invent an owner when it does not.\n\n"
-    "Use only what the transcript supports and never invent details. If the "
-    "transcript is too short or too garbled to summarise, say so plainly "
-    "instead of padding."
+    "Use only what the transcript supports and never invent details.\n\n"
+    "Always produce a summary. A short transcript is not a reason to refuse: "
+    "give the Overview section alone, in a sentence or two, and omit the "
+    "others. Only say a transcript cannot be summarised when it contains no "
+    "intelligible speech at all."
 )
 
 
@@ -1461,9 +1463,14 @@ async def summarize(
         raise HTTPException(
             status_code=400, detail="There is no transcript to summarise."
         )
-    if len(text) < 40:
+    # Only refuse what genuinely cannot be summarised. The old floor of 40
+    # characters rejected ordinary short recordings -- "Hello, my name is Yash."
+    # is 23 -- which is why summarising appeared to work only sometimes. The
+    # prompt now handles brevity by shortening the summary instead of refusing.
+    if len(text.split()) < 3:
         raise HTTPException(
-            status_code=400, detail="This transcript is too short to summarise."
+            status_code=400,
+            detail="There is not enough speech in this recording to summarise.",
         )
     try:
         summary = await asyncio.to_thread(_run_summary, text)
