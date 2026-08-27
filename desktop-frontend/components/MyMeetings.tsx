@@ -183,13 +183,11 @@ export default function MyMeetings() {
       return;
     }
 
-    // Summarise what is actually on screen, so a diarised view is summarised
-    // with its speaker labels intact.
-    const rows = getDiarizedRows(selectedMeeting);
-    const text =
-      detailView === "diarize" && rows
-        ? rows.map((r) => `${r.speaker}: ${r.text}`).join("\n\n")
-        : getPlainText(selectedMeeting);
+    // Always summarise the unlabelled transcript, whichever view is open.
+    // Feeding it "Speaker 1: ..." made the model summarise who spoke rather
+    // than what was discussed, producing "Speaker 2 proposed..." bullets
+    // instead of a summary of the conversation.
+    const text = getPlainText(selectedMeeting);
 
     setShowSummary(true);
     setSummaryError(null);
