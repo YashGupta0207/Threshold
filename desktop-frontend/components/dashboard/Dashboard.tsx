@@ -31,6 +31,7 @@ import {
   fetchPendingJobs,
   ackJob,
 } from "@/lib/diarizeJobs";
+import { reportUsageSeconds } from "@/lib/usage";
 import ConfirmModal from "@/components/ui/ConfirmModal";
 import ScrollNav from "@/components/ui/ScrollNav";
 import AudioPlayer from "@/components/ui/AudioPlayer";
@@ -1388,6 +1389,9 @@ export default function Dashboard() {
       };
       // Always persist the meeting, even if the user moved on to a new session.
       addMeeting(record);
+      // Report the length once, here, because this is the one place a
+      // recording is finished and its duration is known.
+      void reportUsageSeconds(durationSec, localStorage.getItem("token"));
       // …but only touch the live UI if we're still on the same session.
       if (sid === sessionIdRef.current) {
         setSavedMeetingId(record.id);

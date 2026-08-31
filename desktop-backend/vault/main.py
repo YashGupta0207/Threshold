@@ -462,6 +462,27 @@ def get_current_user(
         raise HTTPException(status_code=401, detail="Invalid authentication token")
 
 
+# What a new account gets until an admin changes it.
+DEFAULT_MINUTES_ALLOWED = 60
+
+
+def user_minutes(user_doc: dict) -> tuple[float, int]:
+    """(used, allowed) in minutes, with sane values for older records.
+
+    Accounts predating the quota have neither field, so they read as 0 used
+    against the default allowance rather than as an exhausted quota.
+    """
+    try:
+        used = round(float(user_doc.get("minutesUsed") or 0), 1)
+    except (TypeError, ValueError):
+        used = 0.0
+    try:
+        allowed = int(user_doc.get("minutesAllowed") or DEFAULT_MINUTES_ALLOWED)
+    except (TypeError, ValueError):
+        allowed = DEFAULT_MINUTES_ALLOWED
+    return max(0.0, used), max(0, allowed)
+
+
 def user_is_allowed(user_doc: dict) -> bool:
     """Whether this account may use the app's features.
 
@@ -587,6 +608,8 @@ def signup(user: UserSignup):
         "createdAt": datetime.now(timezone.utc).isoformat(),
         # New accounts start blocked. An admin turns them on from the portal.
         "allowed": False,
+        "minutesUsed": 0,
+        "minutesAllowed": DEFAULT_MINUTES_ALLOWED,
     }
     users_cont.create_item(user_doc)
     verified_emails.pop(user.email, None)
@@ -828,19 +851,29 @@ def admin_list_users(admin: dict = Depends(get_current_admin)):
     users_cont = get_users_container()
     rows = list(
         users_cont.query_items(
-            "SELECT c.id, c.name, c.email, c.createdAt, c.allowed FROM c",
+            "SELECT c.id, c.name, c.email, c.createdAt, c.allowed, "
+            "c.minutesUsed, c.minutesAllowed FROM c",
             enable_cross_partition_query=True,
         )
     )
     # Normalise here so the portal never has to reason about a missing field.
     for row in rows:
         row["allowed"] = user_is_allowed(row)
+        row["minutesUsed"], row["minutesAllowed"] = user_minutes(row)
     rows.sort(key=lambda u: u.get("createdAt") or "", reverse=True)
     return {"status": "success", "users": rows, "count": len(rows)}
 
 
 class AllowedUpdate(BaseModel):
     allowed: bool
+
+
+class MinutesUpdate(BaseModel):
+    minutes_allowed: int
+
+
+class UsageReport(BaseModel):
+    seconds: float
 
 
 @app.patch("/admin/users/{user_id}/allowed")
@@ -875,6 +908,92 @@ def admin_set_user_allowed(
         "status": "success",
         "id": user_id,
         "allowed": user_doc["allowed"],
+    }
+
+
+@app.patch("/admin/users/{user_id}/minutes")
+def admin_set_user_minutes(
+    user_id: str,
+    body: MinutesUpdate,
+    admin: dict = Depends(get_current_admin),
+):
+    """Set how many minutes this account is allowed in total."""
+    if body.minutes_allowed < 0:
+        raise HTTPException(status_code=400, detail="Minutes cannot be negative.")
+
+    users_cont = get_users_container()
+    rows = list(
+        users_cont.query_items(
+            "SELECT * FROM c WHERE c.id = @id",
+            parameters=[{"name": "@id", "value": user_id}],
+            enable_cross_partition_query=True,
+        )
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user_doc = rows[0]
+    user_doc["minutesAllowed"] = int(body.minutes_allowed)
+    user_doc.setdefault("minutesUsed", 0)
+    try:
+        users_cont.upsert_item(user_doc)
+    except Exception as exc:
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=503,
+            detail=f"Could not save the change ({type(exc).__name__}).",
+        )
+    used, allowed = user_minutes(user_doc)
+    return {
+        "status": "success",
+        "id": user_id,
+        "minutesUsed": used,
+        "minutesAllowed": allowed,
+    }
+
+
+@app.post("/usage/minutes")
+def report_usage(
+    body: UsageReport,
+    user: dict = Depends(require_allowed_user),
+):
+    """Add a finished recording's length to this account's used minutes.
+
+    Reported once per recording by the client rather than measured per request.
+    The live speaker view re-diarises the whole recording on every pass, so
+    counting server side would charge the same audio over and over.
+    """
+    email = user.get("sub") or user.get("email") or ""
+    seconds = max(0.0, float(body.seconds or 0))
+    if seconds <= 0:
+        return {"status": "success", "minutesUsed": 0}
+
+    users_cont = get_users_container()
+    rows = list(
+        users_cont.query_items(
+            "SELECT * FROM c WHERE c.email = @email",
+            parameters=[{"name": "@email", "value": email}],
+            enable_cross_partition_query=True,
+        )
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    user_doc = rows[0]
+    used, allowed = user_minutes(user_doc)
+    user_doc["minutesUsed"] = round(used + seconds / 60.0, 1)
+    user_doc.setdefault("minutesAllowed", allowed)
+    try:
+        users_cont.upsert_item(user_doc)
+    except Exception:
+        # Usage accounting must never break a recording that already happened.
+        traceback.print_exc()
+        return {"status": "error", "minutesUsed": used}
+
+    return {
+        "status": "success",
+        "minutesUsed": user_doc["minutesUsed"],
+        "minutesAllowed": allowed,
     }
 
 
