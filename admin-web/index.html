@@ -275,8 +275,14 @@
               <button type="button" role="switch" aria-checked="${on}"
                 data-id="${esc(u.id)}" data-allowed="${on}"
                 title="${on ? "Allowed to use ThreadNotes" : "Blocked \u2014 waiting for approval"}"
-                class="allow-btn relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors disabled:opacity-50 ${on ? "bg-teal-500" : "bg-slate-300"}">
-                <span class="inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${on ? "translate-x-6" : "translate-x-1"}"></span>
+                class="allow-btn"
+                style="position:relative;display:inline-flex;align-items:center;gap:8px;background:none;border:0;padding:0;cursor:pointer;">
+                <span style="position:relative;display:inline-block;width:44px;height:24px;border-radius:9999px;transition:background-color .15s;background:${on ? "#16a34a" : "#dc2626"};">
+                  <span style="position:absolute;top:3px;left:${on ? "23px" : "3px"};width:18px;height:18px;border-radius:9999px;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.35);transition:left .15s;"></span>
+                </span>
+                <span style="font-size:11px;font-weight:700;letter-spacing:.04em;color:${on ? "#16a34a" : "#dc2626"};">
+                  ${on ? "ALLOWED" : "BLOCKED"}
+                </span>
               </button>
             </td>
             <td class="px-6 py-3 text-right">
