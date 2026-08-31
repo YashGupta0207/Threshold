@@ -12,6 +12,8 @@ services:
       # have no wheels for it. Match the 3.11 the Dockerfile used.
       - key: PYTHON_VERSION
         value: 3.11.9
+      - key: PYO3_USE_ABI3_FORWARD_COMPATIBILITY
+        value: "1"
 
       - key: JWT_SECRET
         generateValue: true
