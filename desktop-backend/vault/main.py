@@ -133,14 +133,33 @@ def cosmos_config() -> tuple[str, str, str]:
 
 
 def get_users_container():
+    """The users container.
+
+    Failures here used to escape as a bare 500 "Internal Server Error", which
+    says nothing: a blocked Cosmos firewall, a rejected key and a wrong
+    database name all looked identical from the outside, and the only way to
+    tell them apart was reading the server log. The cause is now logged in full
+    and summarised back to the caller.
+    """
     global _users_cont
     if _users_cont is None:
         endpoint, key, database_name = cosmos_config()
-        client = CosmosClient(endpoint, key)
-        database = client.get_database_client(database_name)
-        _users_cont = database.get_container_client(
-            USERS_CONTAINER or secret("COSMOS_USERS_CONTAINER", "users")
-        )
+        try:
+            client = CosmosClient(endpoint, key)
+            database = client.get_database_client(database_name)
+            _users_cont = database.get_container_client(
+                USERS_CONTAINER or secret("COSMOS_USERS_CONTAINER", "users")
+            )
+        except Exception as exc:
+            traceback.print_exc()
+            _users_cont = None
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Could not connect to the accounts database "
+                    f"({type(exc).__name__}: {str(exc)[:180]})"
+                ),
+            )
     return _users_cont
 
 
@@ -521,13 +540,25 @@ def signup(user: UserSignup):
 @app.post("/login")
 def login(user: UserLogin):
     users_cont = get_users_container()
-    user_list = list(
-        users_cont.query_items(
-            "SELECT * FROM c WHERE c.email = @email",
-            parameters=[{"name": "@email", "value": user.email}],
-            enable_cross_partition_query=True,
+    try:
+        user_list = list(
+            users_cont.query_items(
+                "SELECT * FROM c WHERE c.email = @email",
+                parameters=[{"name": "@email", "value": user.email}],
+                enable_cross_partition_query=True,
+            )
         )
-    )
+    except Exception as exc:
+        # Constructing the client succeeds without touching the network, so a
+        # firewall block or a bad key only shows up here, on the first query.
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Could not reach the accounts database "
+                f"({type(exc).__name__}: {str(exc)[:180]})"
+            ),
+        )
     if not user_list or not bcrypt.checkpw(
         user.password.encode("utf-8"), user_list[0]["password"].encode("utf-8")
     ):
