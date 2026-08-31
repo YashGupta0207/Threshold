@@ -55,3 +55,13 @@ services:
         sync: false
       - key: ADMIN_PASSWORD
         sync: false
+
+  - type: web
+    name: threadnotes-admin-portal
+    env: static
+    buildCommand: ""
+    staticPublishPath: ./admin-web
+    routes:
+      - type: rewrite
+        source: /api/*
+        destination: https://threadnotes-cloud-vault-3pvz.onrender.com/*
