@@ -462,6 +462,61 @@ def get_current_user(
         raise HTTPException(status_code=401, detail="Invalid authentication token")
 
 
+def user_is_allowed(user_doc: dict) -> bool:
+    """Whether this account may use the app's features.
+
+    Accounts created before this flag existed have no field at all. They are
+    treated as allowed, so adding the gate does not silently lock out everyone
+    who had already signed up; only new accounts start blocked.
+    """
+    return bool(user_doc.get("allowed", True))
+
+
+def require_allowed_user(user: dict = Depends(get_current_user)) -> dict:
+    """get_current_user, plus the admin's approval.
+
+    Returns the same JWT payload so callers are unchanged. This costs one
+    Cosmos read per request, which is why it guards the feature endpoints
+    rather than every route -- login and signup must keep working for an
+    account that is still waiting on approval, or the user could never reach
+    the app to see that they are waiting.
+    """
+    email = user.get("sub") or user.get("email") or ""
+    if not email:
+        raise HTTPException(status_code=401, detail="Could not identify the account.")
+
+    users_cont = get_users_container()
+    try:
+        rows = list(
+            users_cont.query_items(
+                "SELECT c.allowed FROM c WHERE c.email = @email",
+                parameters=[{"name": "@email", "value": email}],
+                enable_cross_partition_query=True,
+            )
+        )
+    except Exception as exc:
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Could not check your account status "
+                f"({type(exc).__name__}: {str(exc)[:120]})"
+            ),
+        )
+
+    if not rows:
+        raise HTTPException(status_code=403, detail="This account no longer exists.")
+    if not user_is_allowed(rows[0]):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Your account is awaiting approval. An administrator needs to "
+                "enable it before you can record or transcribe."
+            ),
+        )
+    return user
+
+
 @app.post("/send-signup-otp")
 def send_signup_otp(req: OTPRequest):
     users_cont = get_users_container()
@@ -530,6 +585,8 @@ def signup(user: UserSignup):
         "email": user.email,
         "password": hashed_pw,
         "createdAt": datetime.now(timezone.utc).isoformat(),
+        # New accounts start blocked. An admin turns them on from the portal.
+        "allowed": False,
     }
     users_cont.create_item(user_doc)
     verified_emails.pop(user.email, None)
@@ -704,7 +761,14 @@ def delete_account(
     try:
         props = users_cont.read()
         pk_path = (props.get("partitionKey", {}).get("paths") or ["/id"])[0]
-        pk_value = user_doc.get(pk_path.strip("/"), user_doc.get("id"))
+        pk_field = pk_path.strip("/")
+        # A document with no value at the container's partition-key path
+        # has no partition key at all, and {} is how the SDK addresses
+        # that partition. This container is partitioned on "/tenantIdy"
+        # while documents were written with "tenantId", so that is every
+        # user here -- falling back to the id, as this did, addressed a
+        # partition nothing lives in and every delete failed NotFound.
+        pk_value = user_doc[pk_field] if pk_field in user_doc else {}
         users_cont.delete_item(item=user_doc["id"], partition_key=pk_value)
     except HTTPException:
         raise
@@ -764,12 +828,54 @@ def admin_list_users(admin: dict = Depends(get_current_admin)):
     users_cont = get_users_container()
     rows = list(
         users_cont.query_items(
-            "SELECT c.id, c.name, c.email, c.createdAt FROM c",
+            "SELECT c.id, c.name, c.email, c.createdAt, c.allowed FROM c",
             enable_cross_partition_query=True,
         )
     )
+    # Normalise here so the portal never has to reason about a missing field.
+    for row in rows:
+        row["allowed"] = user_is_allowed(row)
     rows.sort(key=lambda u: u.get("createdAt") or "", reverse=True)
     return {"status": "success", "users": rows, "count": len(rows)}
+
+
+class AllowedUpdate(BaseModel):
+    allowed: bool
+
+
+@app.patch("/admin/users/{user_id}/allowed")
+def admin_set_user_allowed(
+    user_id: str,
+    body: AllowedUpdate,
+    admin: dict = Depends(get_current_admin),
+):
+    """Turn a user's access on or off."""
+    users_cont = get_users_container()
+    rows = list(
+        users_cont.query_items(
+            "SELECT * FROM c WHERE c.id = @id",
+            parameters=[{"name": "@id", "value": user_id}],
+            enable_cross_partition_query=True,
+        )
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user_doc = rows[0]
+    user_doc["allowed"] = bool(body.allowed)
+    try:
+        users_cont.upsert_item(user_doc)
+    except Exception as exc:
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=503,
+            detail=f"Could not save the change ({type(exc).__name__}).",
+        )
+    return {
+        "status": "success",
+        "id": user_id,
+        "allowed": user_doc["allowed"],
+    }
 
 
 @app.delete("/admin/users/{user_id}")
@@ -792,7 +898,14 @@ def admin_delete_user(user_id: str, admin: dict = Depends(get_current_admin)):
     try:
         props = users_cont.read()
         pk_path = (props.get("partitionKey", {}).get("paths") or ["/id"])[0]
-        pk_value = user_doc.get(pk_path.strip("/"), user_doc.get("id"))
+        pk_field = pk_path.strip("/")
+        # A document with no value at the container's partition-key path
+        # has no partition key at all, and {} is how the SDK addresses
+        # that partition. This container is partitioned on "/tenantIdy"
+        # while documents were written with "tenantId", so that is every
+        # user here -- falling back to the id, as this did, addressed a
+        # partition nothing lives in and every delete failed NotFound.
+        pk_value = user_doc[pk_field] if pk_field in user_doc else {}
         users_cont.delete_item(item=user_doc["id"], partition_key=pk_value)
     except HTTPException:
         raise
@@ -808,7 +921,7 @@ def admin_delete_user(user_id: str, admin: dict = Depends(get_current_admin)):
 
 
 @app.get("/azure/token")
-async def get_azure_speech_token(user: dict = Depends(get_current_user)):
+async def get_azure_speech_token(user: dict = Depends(require_allowed_user)):
     # Re-read at call time, exactly like cosmos_config().
     #
     # The module constants are bound once at import. If the gateway happened to
@@ -1160,7 +1273,7 @@ def _run_diarization(audio_bytes: bytes, filename: str, content_type: str = "") 
 @app.post("/diarize/stream")
 async def diarize_stream(
     file: UploadFile = File(...),
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(require_allowed_user),
 ):
     audio_bytes = await file.read()
     if not audio_bytes:
@@ -1212,7 +1325,7 @@ def _run_transcription(audio_bytes: bytes, filename: str, content_type: str = ""
 @app.post("/transcribe/stream")
 async def transcribe_stream(
     file: UploadFile = File(...),
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(require_allowed_user),
 ):
     audio_bytes = await file.read()
     if not audio_bytes:
@@ -1507,7 +1620,7 @@ class SummarizeRequest(BaseModel):
 @app.post("/summarize")
 async def summarize(
     req: SummarizeRequest,
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(require_allowed_user),
 ):
     """Summarise a transcript. Takes the plain or the speaker-labelled text."""
     text = (req.text or "").strip()
@@ -1732,7 +1845,7 @@ async def create_diarize_job(
     segment_seconds: float = Form(1400.0),
     topic_guess: str = Form("Background diarisation"),
     meeting_id: str = Form(""),
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(require_allowed_user),
 ):
     """Stage the audio, record the job, start work, and return immediately."""
     email = user.get("sub") or user.get("email") or ""
@@ -1795,7 +1908,7 @@ async def create_diarize_job(
 
 
 @app.get("/jobs/diarize/pending")
-def list_pending_diarize_jobs(user: dict = Depends(get_current_user)):
+def list_pending_diarize_jobs(user: dict = Depends(require_allowed_user)):
     """Every job this account has not acknowledged yet, oldest first."""
     email = user.get("sub") or user.get("email") or ""
     if not email:
@@ -1816,7 +1929,7 @@ def list_pending_diarize_jobs(user: dict = Depends(get_current_user)):
 
 
 @app.post("/jobs/diarize/{job_id}/ack")
-def ack_diarize_job(job_id: str, user: dict = Depends(get_current_user)):
+def ack_diarize_job(job_id: str, user: dict = Depends(require_allowed_user)):
     """Mark a finished job as consumed so it stops being handed out."""
     email = user.get("sub") or user.get("email") or ""
     try:
