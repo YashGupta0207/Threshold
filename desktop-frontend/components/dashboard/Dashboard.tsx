@@ -1326,12 +1326,16 @@ export default function Dashboard() {
           : lines.map((l) => ({ speaker: "Speaker", text: l, timestamp: "" }));
       const firstWords =
         entries[0]?.text.split(" ").slice(0, 5).join(" ") || "Discussion";
+      // sessionTime is the live recording timer, which is 0 for an uploaded
+      // file. Without the player's resolved length in this chain, uploading a
+      // 30 minute file and transcribing it without diarising recorded a
+      // duration of zero -- and so reported no usage at all.
       const durationSec =
         mergedTranscript.length > 0
           ? Math.round(
               Math.max(0, ...mergedTranscript.map((r) => Number(r.end) || 0)),
             )
-          : sessionTime;
+          : Math.round(resolvedAudioDuration || sessionTime || 0);
       const diarized =
         mergedTranscript.length > 0
           ? mergedTranscript.map((item) => ({
