@@ -4,7 +4,7 @@ services:
     env: python
     plan: free
     autoDeploy: true
-    buildCommand: pip install -r requirements.txt
+    buildCommand: export PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 && pip install -r requirements.txt
     startCommand: uvicorn --app-dir desktop-backend/vault main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /
     envVars:
