@@ -61,7 +61,10 @@ services:
   - type: web
     name: threadnotes-admin-portal
     env: static
-    buildCommand: ""
+    # An explicit no-op. An empty buildCommand can leave Render to auto-detect,
+    # which finds the root requirements.txt and runs a Python build for a site
+    # that is three static files.
+    buildCommand: echo "static site - nothing to build"
     staticPublishPath: ./admin-web
     routes:
       - type: rewrite
