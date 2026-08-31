@@ -223,6 +223,11 @@ export default function Dashboard() {
   // Lines covered by the last completed run, so a refresh is skipped when
   // nothing new has been said.
   const lastRunLinesRef = useRef(-1);
+  // Seconds of THIS session already charged. Usage is billed against the
+  // high-water mark of the session's known length, never per request: the
+  // live speaker view re-diarises the whole recording on every pass, so
+  // charging per call would bill one meeting many times over.
+  const chargedSecondsRef = useRef(0);
   // Mirror the two in-flight flags so runLiveDiarisation can read them without
   // listing them as dependencies (see the note in that callback).
   const liveDiarisingRef = useRef(false);
@@ -597,6 +602,7 @@ export default function Dashboard() {
     setLiveSegmentsUpTo(0);
     setLiveDiariseOn(false);
     lastRunLinesRef.current = -1;
+    chargedSecondsRef.current = 0;
     setTranscriptParts([]);
     setResolvedAudioDuration(0);
     setSessionTime(0);
@@ -814,6 +820,54 @@ export default function Dashboard() {
     const words = transcriptText.trim().split(/\s+/).filter(Boolean).slice(0, 6);
     return words.length ? words.join(" ") : "Background diarisation";
   }, [transcriptText]);
+
+  /**
+   * Charge whatever of this session has not been charged yet.
+   *
+   * Called with the total length known so far, not an increment, so repeated
+   * calls with the same or a smaller figure cost nothing. That is what makes
+   * it safe to call from the diarisation passes, which re-process the whole
+   * recording each time.
+   */
+  const chargeUsage = useCallback((totalSeconds: number, minDelta: number) => {
+    if (!Number.isFinite(totalSeconds)) return;
+    const delta = Math.round(totalSeconds - chargedSecondsRef.current);
+    if (delta < minDelta || delta <= 0) return;
+    chargedSecondsRef.current += delta;
+    void reportUsageSeconds(delta, localStorage.getItem("token"));
+  }, []);
+
+  /**
+   * The longest length this session is known to have, from whichever source
+   * knows best: diarised segment ends, the live speaker pass, the player's
+   * resolved length for an upload, or the recording timer.
+   */
+  const knownSessionSeconds = useMemo(() => {
+    const endOf = (rows: MergedTranscriptRow[]) =>
+      rows.length ? Math.max(0, ...rows.map((r) => Number(r.end) || 0)) : 0;
+    return Math.max(
+      endOf(mergedTranscript),
+      endOf(liveSegments),
+      resolvedAudioDuration || 0,
+      sessionTime || 0,
+    );
+  }, [mergedTranscript, liveSegments, resolvedAudioDuration, sessionTime]);
+
+  // Charge in blocks while a recording runs, so a long meeting is accounted
+  // for even if the app never reaches a clean stop.
+  useEffect(() => {
+    if (!isRecording) return;
+    chargeUsage(knownSessionSeconds, 30);
+  }, [isRecording, knownSessionSeconds, chargeUsage]);
+
+  // Then settle the remainder once the audio stops growing -- a stopped
+  // recording, or an upload whose length has just been resolved. This is what
+  // makes usage independent of whether the user saves.
+  useEffect(() => {
+    if (isRecording) return;
+    const id = setTimeout(() => chargeUsage(knownSessionSeconds, 1), 1500);
+    return () => clearTimeout(id);
+  }, [isRecording, knownSessionSeconds, chargeUsage]);
 
   const handleDiariseInBackground = useCallback(async () => {
     if (!audioFilePath || isDiarizing || bgDiarising || mergedTranscript.length > 0) {
@@ -1127,6 +1181,7 @@ export default function Dashboard() {
     setLiveSegmentsUpTo(0);
     setLiveDiariseOn(false);
     lastRunLinesRef.current = -1;
+    chargedSecondsRef.current = 0;
     setTranscriptParts([]);
     setResolvedAudioDuration(0);
     setIsSaved(false);
@@ -1393,9 +1448,6 @@ export default function Dashboard() {
       };
       // Always persist the meeting, even if the user moved on to a new session.
       addMeeting(record);
-      // Report the length once, here, because this is the one place a
-      // recording is finished and its duration is known.
-      void reportUsageSeconds(durationSec, localStorage.getItem("token"));
       // …but only touch the live UI if we're still on the same session.
       if (sid === sessionIdRef.current) {
         setSavedMeetingId(record.id);
@@ -1470,6 +1522,7 @@ export default function Dashboard() {
     setLiveSegmentsUpTo(0);
     setLiveDiariseOn(false);
     lastRunLinesRef.current = -1;
+    chargedSecondsRef.current = 0;
     setTranscriptParts([]);
     setResolvedAudioDuration(0);
     setUploadFile(null);
