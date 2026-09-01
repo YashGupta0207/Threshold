@@ -147,8 +147,16 @@ def get_users_container():
         try:
             client = CosmosClient(endpoint, key)
             database = client.get_database_client(database_name)
+            # The freshly resolved value wins over the import-time constant.
+            #
+            # USERS_CONTAINER is bound at import WITH a default, so a cold
+            # gateway at boot leaves it as the literal "users" -- truthy, so
+            # "USERS_CONTAINER or ..." never fell through, and the vault spent
+            # the rest of its life querying a container that does not exist
+            # while the real one is "Record". The endpoint, key and database
+            # default to empty strings, which is why only this one broke.
             _users_cont = database.get_container_client(
-                USERS_CONTAINER or secret("COSMOS_USERS_CONTAINER", "users")
+                secret("COSMOS_USERS_CONTAINER", "") or USERS_CONTAINER or "users"
             )
         except Exception as exc:
             traceback.print_exc()
